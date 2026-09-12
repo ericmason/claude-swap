@@ -3675,6 +3675,43 @@ class TestActiveSlotWithASessionProfile:
         assert record.struck_fp is None
         assert record.sentinel == USAGE_TOKEN_EXPIRED
 
+    def test_an_adoption_write_failure_only_costs_this_accounts_row(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Adoption writes the backup, and the store re-raises a write failure.
+
+        The fetch runs in a pool worker whose result goes into
+        `dict(executor.map(...))`, so an escaping OSError ends the collect pass
+        and every other account loses its usage too.
+        """
+        expired = _oauth_creds("sk-active", -3600)
+        fresh = _oauth_creds("sk-other", 7200)
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", self.EMAIL, expired)
+        self._seed_profile(switcher, _oauth_creds("sk-session", 7200))
+
+        infos = [
+            (1, self.EMAIL, "", "", True, expired, ""),
+            (2, "account2@example.com", "", "", False, fresh, ""),
+        ]
+        with patch.object(switcher, "_read_credentials", return_value=expired), \
+             patch("claude_swap.process_detection.scan_env_bound_claude",
+                   side_effect=lambda d: ([], True)), \
+             patch.object(switcher, "_adopt_session_credential",
+                          side_effect=OSError("No space left on device")), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            records = switcher._run_usage_fetches(infos)
+
+        assert set(records) == {"1", "2"}
+        assert records["2"].usage is not None, (
+            "an adoption write failure on one slot dropped another slot's row"
+        )
+        assert records["1"].sentinel == USAGE_TOKEN_EXPIRED
+        post.assert_not_called()
+
+
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
 

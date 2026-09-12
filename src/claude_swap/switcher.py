@@ -4513,6 +4513,20 @@ class ClaudeAccountSwitcher:
                 # A holder owns the slot; deferring costs a pass and spends
                 # nothing.
                 return _defer(force_refresh)
+            except Exception:
+                # Adoption writes the slot backup, and the credential store
+                # re-raises a write failure (full disk, a permission change)
+                # rather than swallowing it. This runs in the collector's
+                # worker thread, whose return value lands in
+                # ``dict(executor.map(...))``, so an exception escaping here
+                # ends the whole pass and drops every other account's usage
+                # with it. One account defers; the rest still collect.
+                self._logger.warning(
+                    "Could not adopt account %s's session profile "
+                    "credential; deferring its usage to the next pass.",
+                    account_num, exc_info=True,
+                )
+                return _defer(force_refresh)
             if adoption.liveness.state != PROFILE_IDLE:
                 self._logger.info(
                     "Account %s has %s as of adoption's lock; reporting the "
