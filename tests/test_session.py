@@ -1715,6 +1715,42 @@ class TestGuards:
         )
         assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
 
+    def test_switch_refuses_a_session_that_starts_while_adoption_waits(
+        self, seeded_switcher, monkeypatch
+    ):
+        """The pre-lock probe said idle and the under-lock one says live.
+
+        `setup_session` reuses a valid profile on a fast path that takes no
+        lock and writes no registry record, so a `claude --resume` really can
+        appear in this window. Adoption refuses the write, and the switch has
+        to refuse with it: activating the backup it declined to advance is
+        activating a generation the new session is already rotating past.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        answers = [([], True), ([4242], True)]
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: answers.pop(0) if answers else ([4242], True),
+        )
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert not answers, "the under-lock re-probe never ran"
+        # Neither copy moved: the live credential stayed out of the backup.
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
     def test_switch_warns_about_an_unregistered_session_on_the_same_generation(
         self, seeded_switcher, monkeypatch
     ):

@@ -119,6 +119,21 @@ class ProfileLiveness(NamedTuple):
     detail: str
 
 
+class AdoptionResult(NamedTuple):
+    """What :meth:`ClaudeAccountSwitcher._adopt_session_credential` did.
+
+    ``adopted`` says whether the backup was advanced. ``liveness`` is the
+    answer the UNDER-LOCK re-probe gave, which is the one callers must act on:
+    a profile that was idle before the lock and live after it is live, and a
+    caller that keeps its own pre-lock answer walks straight into the write
+    adoption just refused. ``PROFILE_IDLE`` with ``adopted`` False is the
+    ordinary "nothing to adopt" case (the profile is not ahead of the backup).
+    """
+
+    adopted: bool
+    liveness: ProfileLiveness
+
+
 # Service name under which the legacy ``keyring`` backend stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
 # and for the Windows Credential Manager migration).
@@ -2970,7 +2985,7 @@ class ClaudeAccountSwitcher:
         email: str,
         org_uuid: str,
         liveness: ProfileLiveness | None = None,
-    ) -> bool:
+    ) -> AdoptionResult:
         """Capture a quiescent session profile's credential into the slot backup.
 
         The complement of ``_post_backup_write``: that direction invalidates
@@ -2985,45 +3000,50 @@ class ClaudeAccountSwitcher:
         Only while the profile is idle: a live claude is rotating that family
         and owns it, and a profile whose liveness could not be determined is
         not known to be idle, so neither is adopted. Callers that need to say
-        WHY adoption was refused ask :meth:`_session_profile_liveness`
-        themselves and pass the answer in; ``liveness`` also lets them avoid a
-        second walk of the process table.
+        WHY adoption was refused read it off the returned
+        :class:`AdoptionResult`; passing ``liveness`` in lets a caller that
+        already asked the question avoid a second walk of the process table.
 
         Decided and written under cswap's own lock, since ``_bootstrap`` and
         the consume gate's persist move the same two copies. The liveness
         answer is taken BEFORE the lock -- the probe reads every process on the
         machine, and this runs inside the usage collector's thread pool, so
         holding the lock across it would serialize the whole pass behind one
-        process-table walk -- and the registry half is re-read cheaply under
-        the lock, which is the half that changes when a `cswap run` starts
-        while we decide. The store write is deliberately the pure one:
-        ``_post_backup_write`` would invalidate the very profile just
-        captured, and the two now hold the same generation. Returns whether
-        the backup was advanced.
-        """
-        from claude_swap.session import scan_live_sessions
+        process-table walk -- and it is asked again IN FULL under the lock,
+        because only the full probe sees the session that starts while we
+        wait. The registry half alone does not: ``setup_session`` reuses a
+        valid profile on its pre-lock fast path (``session.py``), so a
+        `claude --resume` can be running against this profile with no registry
+        record at all, and copying its live credential into the backup is the
+        write this method exists to never make. The second walk costs one
+        process-table read per IDLE profile -- LIVE and UNKNOWN ones take the
+        cheap early exit above and never reach the lock -- and it is the price
+        of a correct write.
 
-        session_dir = self._session_dir(account_num, email)
+        The store write is deliberately the pure one: ``_post_backup_write``
+        would invalidate the very profile just captured, and the two now hold
+        the same generation.
+
+        Returns an :class:`AdoptionResult`; callers must read its ``liveness``
+        rather than keep their own pre-lock answer.
+        """
         if liveness is None:
             liveness = self._session_profile_liveness(account_num, email)
         if liveness.state != PROFILE_IDLE:
-            return False
+            return AdoptionResult(False, liveness)
         with FileLock(self.lock_file):
-            # Cheap re-check of the half that can change while we waited for
-            # the lock: a claude started since the probe writes a registry
-            # record, and an unreadable record is not an absent one.
-            sessions, unreadable = scan_live_sessions(session_dir)
-            if sessions or unreadable:
-                return False
+            liveness = self._session_profile_liveness(account_num, email)
+            if liveness.state != PROFILE_IDLE:
+                return AdoptionResult(False, liveness)
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
-                return False
+                return AdoptionResult(False, liveness)
             self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
             "into its backup"
         )
-        return True
+        return AdoptionResult(True, liveness)
 
     def _delete_session_profile(self, account_num: str, email: str) -> None:
         """Remove an account's session profile dir and its keychain entry.
@@ -5029,13 +5049,26 @@ class ClaudeAccountSwitcher:
             # answer travels in so the process table is walked once per
             # account per pass, not twice.
             try:
-                if self._adopt_session_credential(
+                result = self._adopt_session_credential(
                     str(num), email, org_uuid, liveness=profile_liveness
-                ):
+                )
+                if result.adopted:
                     creds = session_creds
+                    session_creds = None
+                elif result.liveness.state != PROFILE_IDLE:
+                    # A claude started against the profile between the probe
+                    # above and adoption's lock, so the idle answer this
+                    # branch was chosen on is stale. Keeping it would fall
+                    # through to consume_backup_grant, POST a generation the
+                    # live session has already rotated past, and strike a
+                    # healthy slot for it. Take the same read-only route the
+                    # states that were non-idle all along take, on the
+                    # profile's own credential.
+                    has_live_session = True
+                else:
+                    session_creds = None
             except LockError:
-                pass
-            session_creds = None
+                session_creds = None
         if session_creds:
             session_oauth = oauth.extract_oauth_data(session_creds)
             if session_oauth and session_oauth.get("accessToken"):
@@ -7174,6 +7207,16 @@ class ClaudeAccountSwitcher:
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
             liveness = self._session_profile_liveness(target_account, pre_email)
+            if liveness.state == PROFILE_IDLE:
+                # Adoption re-asks the same question under its lock, and a
+                # claude that started while it waited turns the answer
+                # non-idle. Its answer replaces ours: proceeding on the
+                # pre-lock "idle" would activate the backup adoption just
+                # refused to advance, which is the consumed generation this
+                # whole block exists to keep off the default login.
+                liveness = self._adopt_session_credential(
+                    target_account, pre_email, pre_org, liveness=liveness
+                ).liveness
             if liveness.state != PROFILE_IDLE:
                 if self._session_profile_ahead(target_account, pre_email, pre_org):
                     raise SwitchError(
@@ -7208,10 +7251,6 @@ class ClaudeAccountSwitcher:
                     warning(msg)
                 else:
                     warnings_out.append(msg)
-            else:
-                self._adopt_session_credential(
-                    target_account, pre_email, pre_org, liveness=liveness
-                )
 
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch

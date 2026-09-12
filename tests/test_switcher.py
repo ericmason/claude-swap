@@ -1135,6 +1135,48 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
         assert switcher.read_account_credentials("2", "test@example.com") == backup
 
+    def test_a_session_that_starts_during_adoption_takes_the_read_only_route(
+        self, temp_home: Path, monkeypatch
+    ):
+        """Idle before adoption's lock, live under it.
+
+        The pass chose this branch on the pre-lock answer, so it must take
+        adoption's answer instead of its own: falling through with the stale
+        "idle" POSTs the backup's refresh token through the consume gate, and
+        the live session has already rotated past it, so the server answers
+        invalid_grant and a healthy slot is struck for it.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+        session_dir = switcher._session_dir("2", "test@example.com")
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(session)
+        answers = [([], True), ([4242], True)]
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: answers.pop(0) if answers else ([4242], True),
+        )
+
+        with patch.object(switcher, "consume_backup_grant") as gate, \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        gate.assert_not_called()
+        assert not answers, "the under-lock re-probe never ran"
+        assert record.usage == {"five_hour": {"pct": 7}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert kwargs.get("refresh_via") is None
+        # Nothing adopted: the live session's credential stayed out.
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
     def test_exited_session_rejected_backup_still_refreshes(self, temp_home: Path):
         """With nobody live the backup is cswap's to refresh: a 401 stays an
         error for the store's own retry-and-strike accounting."""
@@ -1274,7 +1316,7 @@ class TestAdoptSessionCredential:
         switcher = self._switcher(backup)
         session_dir = self._seed_profile(switcher, profile)
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is True
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is True
         assert switcher.read_account_credentials("2", self.EMAIL) == profile
         # The profile is the source of that generation, not a stale seed.
         assert (session_dir / ".credentials.json").read_text() == profile
@@ -1288,7 +1330,7 @@ class TestAdoptSessionCredential:
         records.mkdir()
         (records / f"{os.getpid()}.json").write_text(json.dumps({"pid": os.getpid()}))
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is False
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_stale_marked_profile_is_not_adopted(self, temp_home: Path):
@@ -1300,7 +1342,7 @@ class TestAdoptSessionCredential:
         session_dir = self._seed_profile(switcher, profile)
         mark_session_stale(session_dir)
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is False
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_profile_behind_a_fresh_relogin_is_not_adopted(self, temp_home: Path):
@@ -1309,7 +1351,7 @@ class TestAdoptSessionCredential:
         switcher = self._switcher(backup)
         self._seed_profile(switcher, profile)
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is False
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_profile_on_the_backup_generation_is_not_adopted(self, temp_home: Path):
@@ -1317,7 +1359,7 @@ class TestAdoptSessionCredential:
         switcher = self._switcher(creds)
         self._seed_profile(switcher, creds)
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is False
 
     def test_unprobeable_profile_is_not_adopted(
         self, temp_home: Path, monkeypatch
@@ -1334,7 +1376,7 @@ class TestAdoptSessionCredential:
             lambda d: ([], False),
         )
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is False
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_unregistered_live_profile_is_not_adopted(
@@ -1351,7 +1393,36 @@ class TestAdoptSessionCredential:
             lambda d: ([123], True),
         )
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    def test_a_session_that_starts_while_the_lock_is_awaited_is_not_adopted(
+        self, temp_home: Path, monkeypatch
+    ):
+        """Idle before the lock, live under it.
+
+        The registry half alone cannot close this window: `setup_session`
+        reuses a valid profile on a pre-lock fast path that writes no record,
+        so the session that starts here is invisible to it. Only the full
+        re-probe sees it, and without the re-probe its live credential is
+        copied into the backup.
+        """
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        self._seed_profile(switcher, profile)
+        answers = [([], True), ([4242], True)]
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: answers.pop(0) if answers else ([4242], True),
+        )
+
+        result = switcher._adopt_session_credential("2", self.EMAIL, "org-uuid")
+
+        assert result.adopted is False
+        assert result.liveness.state == "live"
+        assert result.liveness.pids == [4242]
+        assert not answers, "the under-lock re-probe never ran"
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_profile_logged_in_as_another_account_is_not_adopted(
@@ -1362,7 +1433,7 @@ class TestAdoptSessionCredential:
         switcher = self._switcher(backup)
         self._seed_profile(switcher, profile, email="other@example.com")
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid").adopted is False
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
 
