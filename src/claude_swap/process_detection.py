@@ -876,6 +876,12 @@ class _PsFallback:
             # profile on a machine with other users.
             return _UNBOUND
         if argv is None:
+            if not is_pid_alive(pid):
+                # It exited between the pid listing and the `ps` snapshot. A
+                # process that no longer exists is not a live claude, and
+                # calling it unknown would wedge every profile on this machine
+                # for as long as short-lived processes keep starting.
+                return _UNBOUND
             return _UNKNOWN         # no trusted reading of this pid at all
         verdict = _classify_argv(argv)
         if verdict == ARGV_OTHER:

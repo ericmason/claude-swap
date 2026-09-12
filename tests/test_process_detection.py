@@ -945,6 +945,21 @@ class TestNothingWeCouldNotReadIsUnbound:
              patch.object(pd, "_pid_map", return_value=None):
             assert scan_env_bound_claude(d) == ([], False)
 
+    def test_a_pid_that_exited_mid_scan_is_not_unknown(self, tmp_path):
+        """`ps` is snapshotted once, after the pid listing, so a short-lived
+        process can be listed and then gone. A pid that no longer exists is
+        not a live claude, and deferring on it wedged every profile on a busy
+        machine."""
+        from claude_swap import process_detection as pd
+
+        d = tmp_path / "1-acct"
+        with patch.object(pd, "_cannot_host_claude", return_value=False), \
+             patch.object(pd, "_candidate_pids", return_value=[4242]), \
+             patch.object(pd, "_read_proc_args", return_value=None), \
+             patch.object(pd, "_pid_map", return_value={}), \
+             patch.object(pd, "is_pid_alive", side_effect=[True, False]):
+            assert scan_env_bound_claude(d) == ([], True)
+
     def test_a_pid_with_argv_but_no_environment_probe_is_unknown(self, tmp_path):
         """The executable and argv probes place it as a main; without the
         combined line there is no environment to place it against."""
