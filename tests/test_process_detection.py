@@ -981,6 +981,17 @@ class TestNothingWeCouldNotReadIsUnbound:
         assert _classify_argv_tokens(
             ["node", "--frobnicate", "0", "/opt/bin/claude"]) == ARGV_UNKNOWN
 
+    def test_stdin_and_end_of_options_are_not_unknown_options(self):
+        """`python -` reads the program from stdin, so there is no script and
+        no claude. The unknown-option rule caught the bare `-` and left every
+        such process unresolved, which held every profile non-quiescent for as
+        long as one was running."""
+        assert _classify_argv("/usr/bin/python3 -") == ARGV_OTHER
+        assert _classify_argv_tokens(["/usr/bin/python3", "-"]) == ARGV_OTHER
+        assert _classify_argv("node -- /opt/bin/claude") == ARGV_CLAUDE
+        assert _classify_argv_tokens(
+            ["node", "--", "/opt/bin/claude"]) == ARGV_CLAUDE
+
     def test_a_flattened_line_with_an_unplaceable_token_is_unknown(self, tmp_path):
         """`-r "/tmp/hook setup.js" /opt/bin/claude` flattens to four words, so
         the walk drops `/tmp/hook` and reads `setup.js` as the script. It

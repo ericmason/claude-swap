@@ -517,6 +517,14 @@ def _classify_argv(argv: str) -> str:
     while rest.startswith("-"):
         parts = rest.split(None, 1)
         flag, remainder = parts[0], (parts[1] if len(parts) > 1 else "")
+        if flag == "-":
+            # The program comes from stdin, so there is no script path and no
+            # claude. Every interpreter here spells it the same way, and it is
+            # not an option, so the unknown-option rule must not catch it.
+            return ARGV_OTHER
+        if flag == "--":
+            rest = remainder
+            break                   # end of options; the script is next
         base = flag.split("=", 1)[0]
         if base in table.inline or (
                 table.cluster is not None and table.cluster.match(base)):
@@ -600,6 +608,11 @@ def _classify_argv_tokens(argv: list[str]) -> str:
     i = 1
     while i < len(argv) and argv[i].startswith("-"):
         flag = argv[i]
+        if flag == "-":
+            return ARGV_OTHER       # the program comes from stdin
+        if flag == "--":
+            i += 1
+            break                   # end of options; the script is next
         base = flag.split("=", 1)[0]
         if base in table.inline or (
                 table.cluster is not None and table.cluster.match(base)):
