@@ -13,6 +13,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 from claude_swap import macos_keychain
 
@@ -92,6 +93,31 @@ from claude_swap.usage_store import (
     UsageStore,
     with_sentinel,
 )
+
+# The three answers a session profile can give about whether a claude is
+# running against it. "unknown" is its own state on purpose: the guard side
+# (never rewrite credentials under a live session) and the adoption side
+# (never leave a consumed generation in the backup) need opposite defaults for
+# it, so collapsing it into either of the other two is wrong for one of them.
+PROFILE_LIVE = "live"
+PROFILE_IDLE = "idle"
+PROFILE_UNKNOWN = "unknown"
+
+
+class ProfileLiveness(NamedTuple):
+    """What :meth:`ClaudeAccountSwitcher._session_profile_liveness` found.
+
+    ``detail`` is a human phrase naming what made the state non-idle, ready to
+    drop into a refusal message ("Account-2 (...) has {detail}"); it is empty
+    for ``PROFILE_IDLE``. ``pids`` are the instances seen, registered or not,
+    and are empty for both other states.
+    """
+
+    state: str
+    pids: list[int]
+    unreadable: int
+    detail: str
+
 
 # Service name under which the legacy ``keyring`` backend stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
@@ -2750,59 +2776,91 @@ class ClaudeAccountSwitcher:
         sessions, _ = scan_live_sessions(self._session_dir(account_num, email))
         return [s.pid for s in sessions]
 
+    def _session_profile_liveness(
+        self, account_num: str, email: str
+    ) -> ProfileLiveness:
+        """Whether a claude is running on this profile: live, idle, or unknown.
+
+        A bool cannot serve both sides of this question, because the two sides
+        want opposite defaults for the third state. Destroying credential
+        material under the profile has to read "we could not tell" as live
+        (:func:`profile_is_quiescent`, :meth:`_session_profile_may_be_live`):
+        rewriting on an unknown is the mid-session logout. Adopting the
+        profile's credential into the backup asks the opposite question -- is
+        it safe to advance the backup to what an exited session left behind --
+        and reading an unknown as live there leaves a consumed generation in
+        the backup, which the next switch activates and the next usage pass
+        POSTs for an invalid_grant that strikes a healthy slot. So the answer
+        is three-way, and carries the reason it is not "idle" for the callers
+        that put it in a message.
+
+        The registry is asked first because it is two small file reads, and the
+        CLAUDE_CONFIG_DIR probe walks the whole process table; the registry
+        alone is also what missed the `claude --resume` main behind the
+        mid-session logout, which is why the probe is asked at all.
+        """
+        from claude_swap.session import scan_live_sessions
+
+        session_dir = self._session_dir(account_num, email)
+        pids = self._live_session_pids(account_num, email)
+        if pids:
+            return ProfileLiveness(
+                PROFILE_LIVE, pids, 0,
+                "a live session-mode Claude instance "
+                f"(PID {', '.join(map(str, pids))})",
+            )
+        _, unreadable = scan_live_sessions(session_dir)
+        if unreadable:
+            # A record we could not read may name a live PID, and unreadable
+            # is never absent.
+            return ProfileLiveness(
+                PROFILE_UNKNOWN, [], unreadable,
+                f"{unreadable} session record(s) that could not be read",
+            )
+        if not session_dir.is_dir():
+            # No profile to run against, so nothing can be live in it, and
+            # nothing in it to invalidate or adopt either. The probe walks the
+            # whole process table, so this is worth skipping.
+            return ProfileLiveness(PROFILE_IDLE, [], 0, "")
+        from claude_swap.process_detection import scan_env_bound_claude
+
+        bound, probed = scan_env_bound_claude(session_dir)
+        if bound:
+            return ProfileLiveness(
+                PROFILE_LIVE, bound, 0,
+                f"{len(bound)} live Claude instance(s) bound to its session "
+                "profile that the session registry does not list "
+                f"(PID {', '.join(map(str, bound))})",
+            )
+        if not probed:
+            return ProfileLiveness(
+                PROFILE_UNKNOWN, [], 0,
+                "a session profile whose liveness could not be determined "
+                "(the process table could not be read)",
+            )
+        return ProfileLiveness(PROFILE_IDLE, [], 0, "")
+
     def _session_profile_may_be_live(self, account_num: str, email: str) -> bool:
         """Whether anything says a claude could be running on this profile.
 
-        The session registry alone is what missed the `claude --resume` main
-        behind the mid-session logout, so the CLAUDE_CONFIG_DIR probe is asked
-        too, and a probe that could not run counts as "may be live". This is
-        the guard side of the question :func:`profile_is_quiescent` answers for
+        The guard side of the question :func:`profile_is_quiescent` answers for
         bootstrap, and it fails closed for the same reason: the caller's other
         branch deletes the profile's credential material, and doing that under
-        a live instance logs it out mid-conversation.
+        a live instance logs it out mid-conversation. So both non-idle states
+        of :meth:`_session_profile_liveness` answer True here.
 
         Distinct from :meth:`_live_session_pids`, which is scan-shaped and
         drops the unreadable count, so it answers "which PIDs" rather than
         "could anything be live" and must not be reused here.
         """
-        from claude_swap.session import scan_live_sessions
-
-        session_dir = self._session_dir(account_num, email)
-        sessions, unreadable = scan_live_sessions(session_dir)
-        if sessions:
-            return True
-        if unreadable:
-            # A record we could not read may name a live PID. Same rule as
-            # profile_is_quiescent, which this method is the guard side of:
-            # unreadable is never absent.
-            self._logger.debug(
-                "Account %s's session profile has %s unreadable session "
-                "record(s); deferring credential invalidation.",
-                account_num, unreadable,
-            )
-            return True
-        if not session_dir.is_dir():
-            # No profile to run against, so nothing can be live in it — and
-            # the caller's other branch has nothing to invalidate either. The
-            # probe walks the whole process table, so this is worth skipping.
+        liveness = self._session_profile_liveness(account_num, email)
+        if liveness.state == PROFILE_IDLE:
             return False
-        from claude_swap.process_detection import scan_env_bound_claude
-
-        bound, probed = scan_env_bound_claude(session_dir)
-        if bound:
-            self._logger.debug(
-                "Account %s's session profile has %s unregistered live "
-                "instance(s); deferring credential invalidation.",
-                account_num, len(bound),
-            )
-            return True
-        if not probed:
-            self._logger.debug(
-                "Account %s's session profile could not be probed for live "
-                "instances; deferring credential invalidation.", account_num,
-            )
-            return True
-        return False
+        self._logger.debug(
+            "Account %s's session profile has %s; deferring credential "
+            "invalidation.", account_num, liveness.detail,
+        )
+        return True
 
     def _ensure_no_live_session(self, account_num: str, email: str, action: str) -> None:
         """Refuse a destructive operation while a session-mode claude is live.
@@ -2907,7 +2965,11 @@ class ClaudeAccountSwitcher:
         return profile if newer else None
 
     def _adopt_session_credential(
-        self, account_num: str, email: str, org_uuid: str
+        self,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        liveness: ProfileLiveness | None = None,
     ) -> bool:
         """Capture a quiescent session profile's credential into the slot backup.
 
@@ -2920,19 +2982,38 @@ class ClaudeAccountSwitcher:
         the profile keeps passing the local reuse check and is never
         re-bootstrapped.
 
-        Only while the profile is quiescent: a live claude is rotating that
-        family and owns it. Decided and written under cswap's own lock, since
-        ``_bootstrap`` and the consume gate's persist move the same two
-        copies. The store write is deliberately the pure one:
+        Only while the profile is idle: a live claude is rotating that family
+        and owns it, and a profile whose liveness could not be determined is
+        not known to be idle, so neither is adopted. Callers that need to say
+        WHY adoption was refused ask :meth:`_session_profile_liveness`
+        themselves and pass the answer in; ``liveness`` also lets them avoid a
+        second walk of the process table.
+
+        Decided and written under cswap's own lock, since ``_bootstrap`` and
+        the consume gate's persist move the same two copies. The liveness
+        answer is taken BEFORE the lock -- the probe reads every process on the
+        machine, and this runs inside the usage collector's thread pool, so
+        holding the lock across it would serialize the whole pass behind one
+        process-table walk -- and the registry half is re-read cheaply under
+        the lock, which is the half that changes when a `cswap run` starts
+        while we decide. The store write is deliberately the pure one:
         ``_post_backup_write`` would invalidate the very profile just
         captured, and the two now hold the same generation. Returns whether
         the backup was advanced.
         """
-        from claude_swap.session import profile_is_quiescent
+        from claude_swap.session import scan_live_sessions
 
         session_dir = self._session_dir(account_num, email)
+        if liveness is None:
+            liveness = self._session_profile_liveness(account_num, email)
+        if liveness.state != PROFILE_IDLE:
+            return False
         with FileLock(self.lock_file):
-            if not profile_is_quiescent(session_dir):
+            # Cheap re-check of the half that can change while we waited for
+            # the lock: a claude started since the probe writes a registry
+            # record, and an unreadable record is not an absent one.
+            sessions, unreadable = scan_live_sessions(session_dir)
+            if sessions or unreadable:
                 return False
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
@@ -4901,7 +4982,15 @@ class ClaudeAccountSwitcher:
             session_identity_drifted,
         )
 
-        has_live_session = bool(self._live_session_pids(str(num), email))
+        # "Not idle" rather than "has a registered PID": a profile whose
+        # liveness could not be determined must take the same read-only route
+        # as a live one. The alternative is the fall-through at the bottom,
+        # which POSTs the backup's refresh token through consume_backup_grant
+        # -- and if a live claude has already rotated that family, the server
+        # answers invalid_grant and a healthy slot is struck for a credential
+        # it never had a problem with.
+        profile_liveness = self._session_profile_liveness(str(num), email)
+        has_live_session = profile_liveness.state != PROFILE_IDLE
 
         # A session profile supersedes the backup copy as this account's
         # credential truth: claude rotates the token family inside the profile
@@ -4935,10 +5024,14 @@ class ClaudeAccountSwitcher:
             # backup's generation, or behind a fresh re-login in the backup,
             # needs no adoption and takes the same path on the backup. An
             # adoption refused for any other reason (lock contention, a
-            # session record that could not be read) leaves both copies as
-            # they were.
+            # session record that could not be read between the probe above
+            # and the lock) leaves both copies as they were. The liveness
+            # answer travels in so the process table is walked once per
+            # account per pass, not twice.
             try:
-                if self._adopt_session_credential(str(num), email, org_uuid):
+                if self._adopt_session_credential(
+                    str(num), email, org_uuid, liveness=profile_liveness
+                ):
                     creds = session_creds
             except LockError:
                 pass
@@ -7055,8 +7148,6 @@ class ClaudeAccountSwitcher:
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
-        from claude_swap.session import scan_live_sessions
-
         self._refuse_session_shell()
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
@@ -7067,48 +7158,60 @@ class ClaudeAccountSwitcher:
         # certain to fail: refuse. With nothing running against the profile
         # the fix is simpler still — adopt its credential into the backup
         # first, and the switch activates the live generation.
+        #
+        # Which of those three applies is the liveness question, and it is
+        # asked of the process table as well as the session registry: the
+        # registry misses a `claude --resume` main, and reading a profile one
+        # of those is holding as idle is what activates a consumed backup with
+        # no warning at all. A profile whose liveness could not be determined
+        # is refused rather than adopted or activated, because neither the
+        # "nothing is rotating this family" that adoption needs nor the "the
+        # backup is the current generation" that activation needs has been
+        # established.
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
-            sessions, unreadable = scan_live_sessions(
-                self._session_dir(target_account, pre_email)
-            )
-            pids = [s.pid for s in sessions]
-            if pids or unreadable:
+            liveness = self._session_profile_liveness(target_account, pre_email)
+            if liveness.state != PROFILE_IDLE:
                 if self._session_profile_ahead(target_account, pre_email, pre_org):
-                    who = (
-                        "a live session-mode Claude instance "
-                        f"(PID {', '.join(map(str, pids))})"
-                        if pids
-                        else f"{unreadable} session record(s) that could not be read"
-                    )
                     raise SwitchError(
-                        f"Account-{target_account} ({pre_email}) has {who}, and "
-                        "its session profile's credential has rotated past the "
-                        "stored backup: the backup is a consumed generation, and "
-                        "activating it would fail with invalid_grant on its first "
-                        "refresh. Exit the session (its credential is adopted into "
-                        "the backup once nothing runs against it), or switch to "
-                        "another account."
+                        f"Account-{target_account} ({pre_email}) has "
+                        f"{liveness.detail}, and its session profile's credential "
+                        "has rotated past the stored backup: the backup is a "
+                        "consumed generation, and activating it would fail with "
+                        "invalid_grant on its first refresh. Exit the session (its "
+                        "credential is adopted into the backup once nothing runs "
+                        "against it), or switch to another account."
                     )
-                if pids:
-                    msg = (
-                        f"Account-{target_account} ({pre_email}) has a live "
-                        "session-mode Claude instance "
-                        f"(PID {', '.join(map(str, pids))}). Running the same "
-                        "account as both the default login and a session can make "
-                        "one copy's token go stale if the server rotates it. If the "
-                        "session later fails to authenticate, exit it and re-run "
-                        f"'cswap run {target_account}'."
+                if liveness.state == PROFILE_UNKNOWN:
+                    raise SwitchError(
+                        f"Account-{target_account} ({pre_email}) has "
+                        f"{liveness.detail}. The stored backup may already be a "
+                        "generation a session consumed, which fails with "
+                        "invalid_grant on its first refresh, and the profile's "
+                        "own credential cannot be adopted into the backup until "
+                        "the profile is known to be idle. Exit any Claude "
+                        "instance running against this account (or fix the "
+                        "unreadable session record), then retry."
                     )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
+                msg = (
+                    f"Account-{target_account} ({pre_email}) has "
+                    f"{liveness.detail}. Running the same account as both the "
+                    "default login and a session can make one copy's token go "
+                    "stale if the server rotates it. If the session later fails "
+                    "to authenticate, exit it and re-run "
+                    f"'cswap run {target_account}'."
+                )
+                if emit_output:
+                    warning(msg)
+                else:
+                    warnings_out.append(msg)
             else:
-                self._adopt_session_credential(target_account, pre_email, pre_org)
+                self._adopt_session_credential(
+                    target_account, pre_email, pre_org, liveness=liveness
+                )
 
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch

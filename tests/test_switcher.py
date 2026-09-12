@@ -1043,6 +1043,98 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is False
         assert kwargs.get("refresh_via") is not None  # consume gate replaces persist
 
+    def test_unprobeable_profile_fetches_read_only_like_a_live_one(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The registry is quiet and the process table could not be read, so
+        an instance may still own this family. Read the profile's credential
+        read-only rather than adopt it: adopting on an unknown hands a family
+        a live claude is rotating to the store."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+        switcher._session_dir("2", "test@example.com").mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([], False),
+        )
+
+        with patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert kwargs.get("refresh_via") is None
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
+    def test_unprobeable_profile_never_refreshes_the_backup_grant(
+        self, temp_home: Path, monkeypatch
+    ):
+        """No profile credential to read either. The backup still serves
+        read-only: POSTing its refresh token through the consume gate is what
+        turns an inconclusive probe into an invalid_grant that strikes a slot
+        whose credential was never the problem."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+        switcher._session_dir("2", "test@example.com").mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([], False),
+        )
+
+        with patch.object(switcher, "consume_backup_grant") as gate, \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        gate.assert_not_called()
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == backup
+        assert kwargs.get("is_active") is True
+        assert kwargs.get("refresh_via") is None
+        assert record.struck_fp is None
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
+    def test_unregistered_live_profile_is_not_adopted_by_the_usage_pass(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A `claude --resume` main writes no session record; the probe is the
+        only thing that sees it, and it owns the profile's family."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+        switcher._session_dir("2", "test@example.com").mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([123], True),
+        )
+
+        with patch.object(switcher, "consume_backup_grant") as gate, \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            switcher._fetch_account_usage(self._info(backup))
+
+        gate.assert_not_called()
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
     def test_exited_session_rejected_backup_still_refreshes(self, temp_home: Path):
         """With nobody live the backup is cswap's to refresh: a 401 stays an
         error for the store's own retry-and-strike accounting."""
@@ -1226,6 +1318,41 @@ class TestAdoptSessionCredential:
         self._seed_profile(switcher, creds)
 
         assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+
+    def test_unprobeable_profile_is_not_adopted(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The registry is quiet and the process table could not be read. An
+        instance the probe failed to see still owns the family it is rotating,
+        so "not known to be live" is not "known to be idle"."""
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        self._seed_profile(switcher, profile)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([], False),
+        )
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    def test_unregistered_live_profile_is_not_adopted(
+        self, temp_home: Path, monkeypatch
+    ):
+        """`claude --resume` writes no session record, so the registry says
+        idle and only the CLAUDE_CONFIG_DIR probe sees the instance."""
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        self._seed_profile(switcher, profile)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([123], True),
+        )
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_profile_logged_in_as_another_account_is_not_adopted(
         self, temp_home: Path

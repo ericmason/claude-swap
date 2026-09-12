@@ -1634,6 +1634,112 @@ class TestGuards:
         # The profile is the source of that generation, not a stale seed.
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
 
+    def test_switch_refuses_a_target_whose_profile_could_not_be_probed(
+        self, seeded_switcher, monkeypatch
+    ):
+        """The registry is quiet and the process table could not be read, so
+        "nothing is running against this profile" was never established. The
+        pre-probe code adopted nothing and activated the backup anyway, which
+        is the consumed generation whenever the unseen session had rotated."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([], False),
+        )
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        # Neither copy moved: no adoption, and no activation.
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_switch_refuses_an_unprobeable_profile_even_on_one_generation(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Both copies hold the same generation, so nothing proves the backup
+        is consumed -- but nothing proves the profile is idle either, and the
+        instance that might be in there rotates the family as it runs. The
+        switch says so instead of activating on the chance it is right."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([], False),
+        )
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="known to be idle"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_switch_refuses_a_target_held_by_an_unregistered_session(
+        self, seeded_switcher, monkeypatch
+    ):
+        """`claude --resume` writes no session record, so the registry alone
+        reads this profile as idle and the switch adopted and activated a
+        credential the running instance still owns."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([4242], True),
+        )
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_switch_warns_about_an_unregistered_session_on_the_same_generation(
+        self, seeded_switcher, monkeypatch
+    ):
+        """An unregistered instance holding the SAME generation the backup
+        holds is the dual-use warning, not a refusal: activating the backup
+        cannot fail on a family nobody has rotated past. Same rule the
+        registry case has always had."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([4242], True),
+        )
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
+
+        op = seeded_switcher._perform_switch(ACCOUNT_NUM, emit_output=False)
+
+        assert any("4242" in w for w in op["warnings"])
+        assert seeded_switcher._read_credentials() == CREDS
+
     def test_backup_credential_write_invalidates_stale_profile(
         self, seeded_switcher, block_real_keychain
     ):
