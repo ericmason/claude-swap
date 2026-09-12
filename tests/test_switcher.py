@@ -9754,6 +9754,54 @@ class TestConsumeGate:
         s._write_json(s.sequence_file, sample_sequence_data)
         return s
 
+    def test_gate_refuses_to_spend_an_unregistered_sessions_grant(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The registry is quiet and the probe sees a `claude --resume`.
+
+        That instance rotates the profile's family as it runs, so the backup's
+        refresh token is a generation it has already spent: POSTing it earns an
+        invalid_grant, which every caller reads as a dead lineage and acts on
+        by striking or quarantining an account whose credential was fine. The
+        gate is the last place that can decline, so it declines.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._session_dir("1", "test@example.com").mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([4242], True),
+        )
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert result.error == "session-not-idle"
+        assert result.credentials is None
+        assert result.consumed_fp is None
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_gate_refuses_when_the_profile_could_not_be_probed(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """"Could not tell" is not "idle": an instance the probe failed to see
+        rotates the family just the same."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._session_dir("1", "test@example.com").mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([], False),
+        )
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert result.error == "session-not-idle"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
     def test_gate_rereads_under_lock_and_posts_rereread_bytes(
         self, temp_home: Path, sample_sequence_data: dict
     ):

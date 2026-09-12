@@ -34,7 +34,25 @@ from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRE
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import (
+    PROFILE_LIVE,
+    PROFILE_UNKNOWN,
+    ClaudeAccountSwitcher,
+    ProfileLiveness,
+)
+
+
+def _live(pid: int = 4242) -> ProfileLiveness:
+    """A LIVE answer from the session-profile probe."""
+    return ProfileLiveness(PROFILE_LIVE, [pid], 0, f"a live instance (PID {pid})")
+
+
+def _unknown() -> ProfileLiveness:
+    """The probe could not tell -- neither live nor established idle."""
+    return ProfileLiveness(
+        PROFILE_UNKNOWN, [], 0,
+        "a session profile whose liveness could not be determined",
+    )
 
 
 class FakeClock:
@@ -1842,7 +1860,7 @@ class TestFreshening:
         h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
         h.make_live("a@example.com", 1)
         with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
+            h.switcher, "session_profile_liveness_for", return_value=_live()
         ), patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
@@ -1857,13 +1875,59 @@ class TestFreshening:
         h.seed(2, "b@example.com", expires_at=1)  # long expired
         h.make_live("a@example.com", 1)
         with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
+            h.switcher, "session_profile_liveness_for", return_value=_live()
         ), patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
         assert outcome is TickOutcome.BLOCKED
         mock_refresh.assert_not_called()
+        assert h.active_number() == 1
+
+
+class TestAnUncertainProfileKeepsItsGrant:
+    """The grant is one-time-use, so only an IDLE profile may spend it.
+
+    The registry check this replaced could not see a `claude --resume` and
+    could not say "I could not tell" at all, so a near-expiry candidate POSTed
+    a refresh token an unregistered session had already spent. invalid_grant
+    reads as a dead lineage, and the tick quarantined an account whose
+    credential was never the problem -- before the switch guard downstream
+    ever saw the uncertainty.
+    """
+
+    def _tick(self, temp_home, liveness):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=1)  # long expired
+        h.make_live("a@example.com", 1)
+        with patch.object(
+            h.switcher, "session_profile_liveness_for", return_value=liveness
+        ), patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
+        ) as mock_refresh:
+            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        return h, outcome, mock_refresh
+
+    def test_a_live_profile_is_skipped_rather_than_quarantined(self, temp_home):
+        h, outcome, mock_refresh = self._tick(temp_home, _live())
+
+        mock_refresh.assert_not_called()
+        assert not h.state().get("quarantine")
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_an_unprobeable_profile_is_skipped_rather_than_quarantined(
+        self, temp_home
+    ):
+        """Same rule for "could not tell": the unseen instance rotates the
+        family as it runs, so its grant is no safer to spend than a live
+        one's. Only an established idle profile may spend it."""
+        h, outcome, mock_refresh = self._tick(temp_home, _unknown())
+
+        mock_refresh.assert_not_called()
+        assert not h.state().get("quarantine")
+        assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
 
 

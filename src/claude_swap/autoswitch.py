@@ -52,7 +52,7 @@ from claude_swap.poll_policy import (
     binding_pct,
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import PROFILE_IDLE, ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -779,13 +779,27 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        if self.switcher.live_session_pids_for(number, email):
+        if (
+            self.switcher.session_profile_liveness_for(number, email).state
+            != PROFILE_IDLE
+        ):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
             # one rotating refresh token in two config dirs (the stale-copy
             # failure class) with nobody reading the warning — and its quota
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
+            #
+            # Not the registry alone, which is what this asked before. It does
+            # not list a `claude --resume`, and it cannot say "I could not
+            # tell" at all, so a near-expiry candidate went on to
+            # consume_backup_grant and POSTed a refresh token the unregistered
+            # session had already spent. The server answered invalid_grant,
+            # which reads as a dead lineage, and the tick quarantined an
+            # account whose credential was never the problem -- before the
+            # switch guard downstream ever got to refuse the UNKNOWN. So both
+            # non-idle states skip the candidate, exactly as a registered live
+            # session always has.
             return "skip-live-session"
         creds = self.switcher.read_account_credentials(number, email)
         if not creds:
@@ -820,6 +834,11 @@ class AutoSwitchEngine:
                 # once the credential is replaced by a re-add).
                 return "identity-conflict"
             return "ok"
+        if outcome.error == "session-not-idle":
+            # A session appeared against the profile between the check above
+            # and the gate's own, which asks the same question. Nothing was
+            # consumed; the candidate is skipped for this tick, not struck.
+            return "skip-live-session"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
         if outcome.error in _SYSTEMIC_STATUSES:

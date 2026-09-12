@@ -235,6 +235,11 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "session-not-idle": (
+        "a Claude instance may be running against this account's session "
+        "profile — its own credential is read instead; exit it to refresh "
+        "the backup"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -2007,6 +2012,19 @@ class ClaudeAccountSwitcher:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)
 
+    def session_profile_liveness_for(
+        self, account_num: str, email: str
+    ) -> ProfileLiveness:
+        """Public wrapper: live/idle/unknown for a slot's session profile.
+
+        What every caller about to spend the slot's backup refresh token must
+        ask, rather than :meth:`live_session_pids_for`: the registry does not
+        list a `claude --resume`, and the grant is one-time-use, so an
+        unregistered session that has already consumed this generation turns
+        the POST into an invalid_grant that quarantines a healthy account.
+        """
+        return self._session_profile_liveness(account_num, email)
+
     def persist_backup_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -2171,6 +2189,27 @@ class ClaudeAccountSwitcher:
             session_identity_drifted,
         )
 
+        # The grant is one-time-use, so the profile must be known IDLE before
+        # it is spent. The registry alone does not establish that -- it does
+        # not list a `claude --resume` -- and an unregistered session that has
+        # already consumed this generation turns the POST into an
+        # invalid_grant, which reads as a dead lineage and quarantines an
+        # account whose credential was never the problem. Asked BEFORE the
+        # lock: the probe walks the process table, this runs in the collector's
+        # thread pool, and a slot with no session profile answers idle from two
+        # file reads without probing at all. LIVE and UNKNOWN both refuse --
+        # the profile holds the current generation in both, and the caller's
+        # own liveness branch (read-only fetch, skipped freshen) is the route
+        # that belongs here.
+        liveness = self._session_profile_liveness(account_num, email)
+        if liveness.state != PROFILE_IDLE:
+            self._logger.info(
+                "Account %s has %s; deferring the backup refresh rather than "
+                "consuming a grant the profile may already have spent.",
+                account_num, liveness.detail,
+            )
+            return oauth.RefreshOutcome(None, "session-not-idle")
+
         try:
             with FileLock(self.lock_file):
                 current, unreadable = self._read_account_credentials_ex(
@@ -2237,10 +2276,12 @@ class ClaudeAccountSwitcher:
                     return oauth.RefreshOutcome(None, "transient")
                 refresh_input = current
                 input_oauth = oauth.extract_oauth_data(refresh_input)
-                # Session-profile precedence: only when no live session owns
-                # the profile (a live claude rotates its own tokens — #97's
-                # rule) and the profile identity — org included: two slots
-                # may share an email across orgs — still matches the slot.
+                # Session-profile precedence: only when nothing owns the
+                # profile (a live claude rotates its own tokens — #97's rule)
+                # and the profile identity — org included: two slots may share
+                # an email across orgs — still matches the slot. The liveness
+                # answer above is the whole question, so this is unconditional
+                # here; a non-idle profile never reaches it.
                 org_uuid = (
                     (self._get_sequence_data() or {})
                     .get("accounts", {})
@@ -2248,38 +2289,37 @@ class ClaudeAccountSwitcher:
                     .get("organizationUuid", "")
                     or ""
                 )
-                if not self._live_session_pids(account_num, email):
-                    sdir = session_dir_for(self.backup_dir, account_num, email)
-                    profile = read_session_credentials(sdir)
+                sdir = session_dir_for(self.backup_dir, account_num, email)
+                profile = read_session_credentials(sdir)
+                if (
+                    profile
+                    # A marked profile's credentials are presumed stale
+                    # (backup changed under the live session — e.g. a
+                    # deliberate re-add/import): never let it supersede
+                    # the backup it is presumed stale against.
+                    and not is_session_stale(sdir)
+                    and not session_identity_drifted(sdir, email, org_uuid)
+                ):
+                    prof_oauth = oauth.extract_oauth_data(profile)
+                    cur_exp = (input_oauth or {}).get("expiresAt") or 0
+                    prof_exp = (prof_oauth or {}).get("expiresAt") or 0
                     if (
-                        profile
-                        # A marked profile's credentials are presumed stale
-                        # (backup changed under the live session — e.g. a
-                        # deliberate re-add/import): never let it supersede
-                        # the backup it is presumed stale against.
-                        and not is_session_stale(sdir)
-                        and not session_identity_drifted(sdir, email, org_uuid)
+                        prof_oauth
+                        and prof_oauth.get("accessToken")
+                        and prof_oauth.get("refreshToken")
+                        and oauth.credential_fingerprint(profile)
+                        != oauth.credential_fingerprint(refresh_input)
+                        and prof_exp > cur_exp
                     ):
-                        prof_oauth = oauth.extract_oauth_data(profile)
-                        cur_exp = (input_oauth or {}).get("expiresAt") or 0
-                        prof_exp = (prof_oauth or {}).get("expiresAt") or 0
-                        if (
-                            prof_oauth
-                            and prof_oauth.get("accessToken")
-                            and prof_oauth.get("refreshToken")
-                            and oauth.credential_fingerprint(profile)
-                            != oauth.credential_fingerprint(refresh_input)
-                            and prof_exp > cur_exp
-                        ):
-                            # The profile holds the newer generation: the
-                            # backup rt is already consumed. Resync so the
-                            # slot's stored credential is the live lineage,
-                            # then consume THAT.
-                            self._write_account_credentials(
-                                account_num, email, profile
-                            )
-                            refresh_input = profile
-                            input_oauth = prof_oauth
+                        # The profile holds the newer generation: the
+                        # backup rt is already consumed. Resync so the
+                        # slot's stored credential is the live lineage,
+                        # then consume THAT.
+                        self._write_account_credentials(
+                            account_num, email, profile
+                        )
+                        refresh_input = profile
+                        input_oauth = prof_oauth
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
