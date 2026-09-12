@@ -82,9 +82,16 @@ def parse_v8_options(text: str) -> tuple[frozenset[str], frozenset[str]]:
 
     V8's options reach node too, and they are where `--max-old-space-size`
     lives, so leaving them out left a common real command line unresolvable.
-    V8 states each option's type on the line below its name; every type other
-    than ``bool`` takes a value, and V8 accepts both `--opt=v` and `--opt v`.
+    V8 states each option's type on the line below its name, and accepts both
+    `--opt=v` and `--opt v` for the types that take a value.
+
+    ``maybe_bool`` is the exception and counts as boolean. Its options are
+    tri-state — `--efficiency-mode`, `--efficiency-mode=true` — so the value
+    is optional and only ever ATTACHED, and filing them with the options that
+    swallow the next token would have `node --efficiency-mode /path/claude`
+    eat the script argument and report a live main as idle.
     """
+    optional = {"maybe_bool"}
     value: set[str] = set()
     boolean: set[str] = set()
     pending: str | None = None
@@ -95,6 +102,7 @@ def parse_v8_options(text: str) -> tuple[frozenset[str], frozenset[str]]:
             continue
         kind = _V8_TYPE.match(line)
         if kind is not None and pending is not None:
-            (boolean if kind.group(1) == "bool" else value).add(pending)
+            takes = kind.group(1) not in ("bool", *optional)
+            (value if takes else boolean).add(pending)
             pending = None
     return frozenset(value), frozenset(boolean - value)

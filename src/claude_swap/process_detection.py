@@ -197,6 +197,12 @@ _ARGV_PROBE_ARGV = ("ps", "-Awwo", "pid=,command=")
 # Just the pids. Used to enumerate candidates where there is no /proc to list.
 _PID_PROBE_ARGV = ("ps", "-Ao", "pid=")
 
+# Who owns each process. A `claude` bound to a profile this tool manages runs
+# as the user running this tool, so a process owned by someone else is not the
+# session at risk — and its environment is unreadable here anyway, which would
+# otherwise leave every root daemon on the machine permanently unknown.
+_UID_PROBE_ARGV = ("ps", "-Ao", "pid=,uid=")
+
 # `ps ewwx` prints `PID argv... VAR=VAL VAR=VAL`, so argv ends at the first
 # env-shaped token. argv can hold its own `=` (`--model=x`, or a prompt saying
 # `FOO=bar`), which would cut it early -- harmless, because that only shortens
@@ -322,6 +328,16 @@ def _interpreter_family(argv0: str) -> str | None:
 # `~/.local/bin/claude` symlink — so the running executable's basename is a
 # version number and nothing about it says "claude". Recognising only the
 # literal basename ruled out every real session on this Mac.
+# Apple's `ps` and `pgrep` print the kernel's short process name wrapped in
+# parentheses when they cannot read the argument area. It is a read failure
+# wearing the shape of an answer, in the executable column and in argv alike.
+_UNREADABLE_FIELD = re.compile(r"^\(.*\)$")
+
+# `bun run x.js` and `deno run x.js` put a subcommand where node puts the
+# script. Reading the subcommand as the script filed every such main as a
+# program called `run`.
+_INTERPRETER_SUBCOMMANDS = frozenset({"run", "exec", "x"})
+
 _CLAUDE_PATH_PART = re.compile(r"(?:^|/)claude(?:/|$)")
 _CLAUDE_VERSIONS = re.compile(r"(?:^|/)claude/versions/")
 _VERSION_NAME = re.compile(r"^[0-9][0-9A-Za-z._+-]*$")
@@ -359,28 +375,72 @@ def _is_claude_binary(executable: str) -> bool:
             or _CLAUDE_VERSIONS.search(executable) is not None)
 
 
-def _may_host_claude(executable: str) -> bool:
-    """Whether a main could be running under this executable.
+# Places a Claude main cannot be installed in. macOS seals the first four
+# against everything short of a system update, and an application bundle runs
+# a GUI app rather than a CLI. A path under one of these is positively not the
+# CLI and not something hosting it.
+_SEALED_DIRS = (
+    "/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/usr/bin/", "/bin/",
+    "/usr/share/", "/Library/",
+)
+_BUNDLE_EXECUTABLE = re.compile(r"/[^/]+\.(?:app|framework|bundle|xpc)/Contents/")
 
-    This is a prefilter, so it may only rule a process OUT, and only on a name
-    it recognises. False means "this is positively some other program"; an
-    executable whose shape this function does not know returns True and is
-    settled by the full argv and environment read instead. Answering False on
-    an unfamiliar name is how the version-named native binary came to hide
-    every real session on this machine.
+# Programs a claude session starts, or that start beside one, and that are
+# positively not it. They inherit CLAUDE_CONFIG_DIR and can outlive the
+# session as orphans, so recognising them is what keeps a profile re-seedable
+# — an unrecognised stray with the variable set defers forever.
+_NOT_CLAUDE_PROGRAMS = frozenset({
+    # shells
+    "sh", "bash", "zsh", "dash", "ksh", "tcsh", "csh", "fish", "login",
+    # the tool subprocesses a session runs
+    "rg", "grep", "egrep", "fgrep", "ag", "ack", "find", "fd", "xargs",
+    "sed", "awk", "cat", "head", "tail", "sort", "uniq", "cut", "tr", "wc",
+    "ls", "cp", "mv", "rm", "mkdir", "touch", "chmod", "chown", "ln", "df",
+    "du", "stat", "file", "which", "env", "echo", "sleep", "true", "false",
+    "date", "basename", "dirname", "realpath", "readlink", "tee", "diff",
+    "patch", "tar", "gzip", "gunzip", "zip", "unzip", "xz", "zstd", "jq",
+    "yq", "curl", "wget", "ssh", "scp", "rsync", "ping", "dig", "nc",
+    "git", "gh", "hub", "svn", "hg", "make", "cmake", "ninja", "gcc", "g++",
+    "clang", "clang++", "cc", "c++", "ld", "ar", "nm", "strip", "install",
+    "docker", "podman", "kubectl", "helm", "terraform", "aws", "gcloud", "az",
+    "npm", "npx", "pnpm", "yarn", "corepack", "uv", "uvx", "pip", "pip3",
+    "poetry", "pipx", "cargo", "rustc", "go", "gofmt", "java", "javac",
+    "ruby", "gem", "bundle", "rake", "perl", "php", "swift", "swiftc",
+    "less", "more", "vi", "vim", "nvim", "emacs", "nano", "pager", "man",
+    "tmux", "screen", "watch", "top", "htop", "ps", "kill", "pkill", "pgrep",
+    "open", "say", "osascript", "pbcopy", "pbpaste", "defaults", "codesign",
+})
 
-    Four shapes count as possibly-claude: the literal `claude` basename, an
-    interpreter that could be hosting the CLI, a path with a `claude`
-    component, and a version-named file, which is what the native installer
-    produces and is indistinguishable from any other product's versioned
-    launcher.
+
+def _known_not_claude(executable: str) -> bool:
+    """Whether this executable is POSITIVELY some program other than the CLI.
+
+    The one question the cheap prefilter is allowed to answer. It is a
+    denylist on purpose: an executable this function has never seen returns
+    False and is settled by the full argv and environment read, because "a
+    name we do not recognise" is not "not claude". Recognising only a fixed
+    set of claude-shaped names instead — the inverse of this — hid six of the
+    eight real sessions running on this machine behind a version-named binary,
+    and would hide any install under a name nobody thought of.
+
+    A `claude` basename, a version-named file, a path with a `claude`
+    component, and an interpreter that could be hosting the CLI all answer
+    False however sealed the directory, so nothing below can rule out a real
+    main by location alone.
     """
     base = os.path.basename(executable)
-    return (base == "claude"
+    if (_is_claude_binary(executable)
             or _INTERPRETER.match(base) is not None
             or _VERSION_NAME.match(base) is not None
-            or _CLAUDE_PATH_PART.search(os.path.dirname(executable)) is not None
-            or executable == _native_claude_binary())
+            or _CLAUDE_PATH_PART.search(os.path.dirname(executable)) is not None):
+        return False
+    if base in _NOT_CLAUDE_PROGRAMS:
+        return True
+    if base == "<defunct>":
+        return True             # a zombie is not running anything
+    if _BUNDLE_EXECUTABLE.search(executable) is not None:
+        return True
+    return executable.startswith(_SEALED_DIRS)
 
 
 def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str] | None:
@@ -471,7 +531,7 @@ def _split_argv_env(rest: str, plain_argv: str | None) -> tuple[str, str | None]
     return rest[: split.start()], rest[split.start():]
 
 
-def _walk_flattened(argv: str) -> tuple[str, bool]:
+def _walk_flattened(argv: str, resolve_cwd=None) -> tuple[str, bool]:
     """One pass over a flattened argv line: ``(verdict, guessed)``.
 
     ``guessed`` records that the walk consumed an option's value by taking one
@@ -484,6 +544,8 @@ def _walk_flattened(argv: str) -> tuple[str, bool]:
     tokens = argv.split()
     if not tokens:
         return ARGV_OTHER, guessed
+    if _UNREADABLE_FIELD.match(tokens[0]):
+        return ARGV_UNKNOWN, guessed    # `(claude)`: nothing was read
     if _is_claude_binary(tokens[0]):
         return ARGV_CLAUDE, guessed
     # Non-native installs reach the CLI through an interpreter, so the binary
@@ -500,7 +562,8 @@ def _walk_flattened(argv: str) -> tuple[str, bool]:
     if family is None:
         return ARGV_OTHER, guessed
     table = _FLAG_TABLES[family]
-    rest = argv.split(None, 1)[1] if len(tokens) > 1 else ""
+    after = _skip_subcommand(tokens, 1, family)
+    rest = argv.split(None, after)[after] if len(tokens) > after else ""
     while rest.startswith("-"):
         parts = rest.split(None, 1)
         flag, remainder = parts[0], (parts[1] if len(parts) > 1 else "")
@@ -534,7 +597,12 @@ def _walk_flattened(argv: str) -> tuple[str, bool]:
     if not script:
         return ARGV_OTHER, guessed
     first = script.split(None, 1)[0]
-    if _is_claude_binary(first) or _CLAUDE_PACKAGE.search(first):
+    resolved = _resolve_script(first, resolve_cwd)
+    if resolved is None:
+        # Relative, and the working directory is hidden, so this token names
+        # either the npm entrypoint or an unrelated worker.
+        return ARGV_UNKNOWN, guessed
+    if _is_claude_binary(resolved) or _CLAUDE_PACKAGE.search(resolved):
         return ARGV_CLAUDE, guessed
     # A first token that already looks like a complete script name ENDS the
     # script argument, so everything after it is claude's own argv rather than
@@ -560,7 +628,7 @@ def _walk_flattened(argv: str) -> tuple[str, bool]:
             guessed)
 
 
-def _classify_argv(argv: str) -> str:
+def _classify_argv(argv: str, resolve_cwd=None) -> str:
     """Classify a FLATTENED argv line: claude, other, or unknown.
 
     `ps` joins arguments with spaces and quotes nothing, so this cannot always
@@ -576,7 +644,7 @@ def _classify_argv(argv: str) -> str:
     from the walk's early exits, which used to answer "not claude" outright
     and so let `node -r "hook -e" /opt/bin/claude` read as inline code.
     """
-    verdict, guessed = _walk_flattened(argv)
+    verdict, guessed = _walk_flattened(argv, resolve_cwd)
     return ARGV_UNKNOWN if guessed and verdict == ARGV_OTHER else verdict
 
 
@@ -587,7 +655,30 @@ class ProcArgs(NamedTuple):
     env: dict[str, str] | None
 
 
-def _classify_argv_tokens(argv: list[str]) -> str:
+def _resolve_script(script: str, resolve_cwd) -> str | None:
+    """An absolute path for a script argument, or None when it cannot be had.
+
+    `node cli.js` is the npm entrypoint or an unrelated worker depending
+    entirely on where it is running, and the argument alone does not say. The
+    working directory does, so a relative script is resolved against it; a
+    working directory that cannot be read leaves the argument unresolvable
+    rather than assumed harmless.
+    """
+    if os.path.isabs(script):
+        return script
+    cwd = resolve_cwd() if resolve_cwd is not None else None
+    return None if cwd is None else os.path.normpath(os.path.join(cwd, script))
+
+
+def _skip_subcommand(argv: list[str], i: int, family: str) -> int:
+    """Step past `run`/`exec`/`x`, which bun and deno take before the script."""
+    if (family in ("bun", "deno") and i < len(argv)
+            and argv[i] in _INTERPRETER_SUBCOMMANDS):
+        return i + 1
+    return i
+
+
+def _classify_argv_tokens(argv: list[str], resolve_cwd=None) -> str:
     """Classify an argv that arrived already separated: claude, other, unknown.
 
     The exact counterpart of :func:`_classify_argv`, which has to re-split a
@@ -600,13 +691,15 @@ def _classify_argv_tokens(argv: list[str]) -> str:
     """
     if not argv:
         return ARGV_OTHER
+    if _UNREADABLE_FIELD.match(argv[0]):
+        return ARGV_UNKNOWN     # `(claude)`: the argument area was not read
     if _is_claude_binary(argv[0]):
         return ARGV_CLAUDE
     family = _interpreter_family(argv[0])
     if family is None:
         return ARGV_OTHER
     table = _FLAG_TABLES[family]
-    i = 1
+    i = _skip_subcommand(argv, 1, family)
     while i < len(argv) and argv[i].startswith("-"):
         flag = argv[i]
         if flag == "-":
@@ -627,7 +720,12 @@ def _classify_argv_tokens(argv: list[str]) -> str:
         i += 1
     if i >= len(argv):
         return ARGV_OTHER
-    script = argv[i]
+    script = _resolve_script(argv[i], resolve_cwd)
+    if script is None:
+        # Relative, and the working directory is hidden, so this token names
+        # either the npm entrypoint or an unrelated worker. `node cli.js` run
+        # from the package directory is exactly how a main looks.
+        return ARGV_UNKNOWN
     if _is_claude_binary(script) or _CLAUDE_PACKAGE.search(script):
         return ARGV_CLAUDE
     return ARGV_OTHER
@@ -788,22 +886,69 @@ def _proc_args_macos(pid: int) -> ProcArgs | None:
 def _cannot_host_claude(pid: int) -> bool:
     """Whether a cheap, POSITIVE read rules this pid out as a claude main.
 
-    False whenever the read failed, so "we could not look" never shortens the
-    work. On macOS this is ``proc_pidpath``; on Linux it is the world-readable
-    ``cmdline``, which also means the environment is never opened for a
-    process that could not be a main anyway.
+    False whenever the read failed or the program is one this module does not
+    recognise, so neither "we could not look" nor "we have never seen this
+    name" shortens the work. On macOS the read is ``proc_pidpath``; on Linux
+    it is the world-readable ``cmdline``, which also keeps the environment
+    from being opened for a process already settled.
     """
     if sys.platform == "darwin":
         executable = _exec_path_macos(pid)
-        return executable is not None and not _may_host_claude(executable)
+        return executable is not None and _known_not_claude(executable)
     if sys.platform.startswith("linux"):
         try:
             raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
         except OSError:
             return False
         argv = [c.decode("utf-8", "replace") for c in raw.split(b"\0") if c]
-        return _classify_argv_tokens(argv) == ARGV_OTHER
+        return bool(argv) and _known_not_claude(argv[0])
     return False
+
+
+_PROC_PIDVNODEPATHINFO = 9
+# `struct proc_vnodepathinfo` is two `vnode_info_path` records, current
+# directory first. The path sits after the 152-byte `vnode_info` header and
+# runs to MAXPATHLEN.
+_VNODEPATHINFO_SIZE = 2352
+_VNODEPATHINFO_CWD = 152
+_MAXPATHLEN = 1024
+
+
+def _proc_uid(pid: int) -> int | None:
+    """The uid owning a process, or None when it cannot be read."""
+    if sys.platform.startswith("linux"):
+        try:
+            return os.stat(f"/proc/{pid}").st_uid
+        except OSError:
+            return None
+    return None
+
+
+def _proc_cwd(pid: int) -> str | None:
+    """A process's working directory, or None when it cannot be read.
+
+    Needed only to resolve a RELATIVE script argument: `node cli.js` names a
+    real entrypoint or a worker depending entirely on where it is running, and
+    without this the two are indistinguishable.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            return os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return None
+    if sys.platform != "darwin":
+        return None
+    libc = _load_libc()
+    if libc is None or not hasattr(libc, "proc_pidinfo"):
+        return None
+    buf = ctypes.create_string_buffer(_VNODEPATHINFO_SIZE)
+    written = libc.proc_pidinfo(pid, _PROC_PIDVNODEPATHINFO, ctypes.c_uint64(0),
+                                buf, _VNODEPATHINFO_SIZE)
+    if written < _VNODEPATHINFO_SIZE:
+        return None
+    path = buf.raw[_VNODEPATHINFO_CWD:_VNODEPATHINFO_CWD + _MAXPATHLEN]
+    cwd = path.split(b"\0", 1)[0].decode("utf-8", "replace")
+    return cwd or None
 
 
 def _read_proc_args(pid: int) -> ProcArgs | None:
@@ -861,6 +1006,17 @@ class _PsFallback:
         self.combined = _pid_map(_ENV_PROBE_ARGV, "CLAUDE_CONFIG_DIR probe")
         self.argvs = _pid_map(_ARGV_PROBE_ARGV, "argv probe")
         self.executables = _pid_map(_COMM_PROBE_ARGV, "executable probe")
+        self.uids = _pid_map(_UID_PROBE_ARGV, "owner probe")
+
+    def _is_ours(self, pid: int) -> bool | None:
+        """Whether this process is owned by the user running this tool."""
+        if self.uids is None:
+            return None
+        owner = self.uids.get(pid)
+        try:
+            return int(owner) == os.getuid()
+        except (TypeError, ValueError):
+            return None
 
     def _executable(self, pid: int) -> str | None:
         """This pid's executable path, or None when `ps` could not read it.
@@ -894,10 +1050,19 @@ class _PsFallback:
         """``bound``, ``unbound``, or ``unknown`` for one pid."""
         executable = self._executable(pid)
         argv = self._argv_text(pid)
-        if executable is not None and not _may_host_claude(executable):
+        recognised = ((executable is not None and _known_not_claude(executable))
+                      or (argv is not None and bool(argv.split())
+                          and _known_not_claude(argv.split()[0])))
+        if executable is not None and _known_not_claude(executable):
             # Positively read, and recognised as some other program. Most of
             # the process table lands here; failing closed on all of it would
             # wedge every profile on a machine with other users.
+            return _UNBOUND
+        if self._is_ours(pid) is False:
+            # Someone else's process, so not the session about to have its
+            # credentials rewritten — and the environment `ps` withholds for
+            # exactly these processes is what would otherwise leave every root
+            # daemon on the machine unknown for good.
             return _UNBOUND
         if argv is None:
             if not is_pid_alive(pid):
@@ -907,18 +1072,23 @@ class _PsFallback:
                 # for as long as short-lived processes keep starting.
                 return _UNBOUND
             return _UNKNOWN         # no trusted reading of this pid at all
-        verdict = _classify_argv(argv)
+        verdict = _classify_argv(argv, lambda: _proc_cwd(pid))
         if verdict == ARGV_OTHER and executable is not None:
             # `comm` reports the executable as a single field, so it survives
             # a path with a space in it that the flattened argv does not. Its
             # reading outranks argv's: naming the CLI itself settles the pid as
-            # a main, and naming an interpreter leaves argv's "no" too weak to
-            # settle anything. That is how a native main under
+            # a main, and naming anything else unrecognised leaves argv's "no"
+            # too weak to settle anything. That is how a native main under
             # `/Users/me/Application Support/claude` came to read as idle.
             verdict = (ARGV_CLAUDE if _is_claude_binary(executable)
                        else ARGV_UNKNOWN)
-        if verdict == ARGV_OTHER:
+        if verdict == ARGV_OTHER and recognised:
             return _UNBOUND
+        if verdict == ARGV_OTHER:
+            # argv named a program nobody listed, so it may be a main under a
+            # name this module has never seen. Only the environment can settle
+            # it, and only against this profile.
+            verdict = ARGV_UNKNOWN
         if self.combined is None or pid not in self.combined:
             # Either a main, or a pid argv could not place; no environment to
             # settle it against either way.
@@ -957,24 +1127,49 @@ class _PsFallback:
 
 
 def _scan_pid(pid: int, target: str) -> str:
-    """One pid's relationship to ``target``, from the structured source."""
+    """One pid's relationship to ``target``, from the structured source.
+
+    Three readings combine. The program settles a pid only when it is
+    RECOGNISED: the CLI, or a program this module positively knows is not it.
+    An unrecognised program could be a main under a name nobody listed, so it
+    cannot answer. The environment settles the rest, and it is conclusive in
+    one direction whatever the program turned out to be — a process bound to
+    another profile, or to none, is not bound to this one. What is left is an
+    unrecognised program bound to THIS profile, which is genuinely unknown: it
+    may be a main, or a tool subprocess that inherited the variable.
+    """
     if _cannot_host_claude(pid):
         return _UNBOUND
     info = _read_proc_args(pid)
     if info is None:
         return _GONE if not is_pid_alive(pid) else _UNREADABLE
-    verdict = _classify_argv_tokens(info.argv)
-    if verdict == ARGV_OTHER:
-        return _UNBOUND
-    if verdict == ARGV_UNKNOWN:
-        return _UNKNOWN
+    verdict = _classify_argv_tokens(info.argv, lambda: _proc_cwd(pid))
+    recognised = bool(info.argv) and _known_not_claude(info.argv[0])
     if info.env is None:
         # Linux shows every process's cmdline and withholds other users'
-        # environ. A main whose environment is hidden is unknown.
-        logger.debug("pid %s looks like a claude main but its environment "
-                     "is not readable", pid)
+        # environ, so argv is the only reading available.
+        if verdict == ARGV_OTHER and recognised:
+            return _UNBOUND
+        owner = _proc_uid(pid)
+        if owner is not None and owner != os.getuid():
+            # Someone else's process. It is not the session this tool is about
+            # to rewrite credentials for, and its environment is exactly what
+            # cannot be read, so deferring on it would defer forever.
+            return _UNBOUND
+        logger.debug("pid %s could not be settled by argv alone and its "
+                     "environment is not readable", pid)
         return _UNKNOWN
-    return _BOUND if info.env.get("CLAUDE_CONFIG_DIR") == target else _UNBOUND
+    if info.env.get("CLAUDE_CONFIG_DIR") != target:
+        return _UNBOUND
+    if verdict == ARGV_CLAUDE:
+        return _BOUND
+    if verdict == ARGV_OTHER and recognised:
+        # A shell or tool that inherited the variable from the session that
+        # started it. These outnumber real mains roughly nine to one and
+        # outlive them as orphans, so binding on the variable alone would hold
+        # the profile un-quiescent forever.
+        return _UNBOUND
+    return _UNKNOWN
 
 
 def scan_env_bound_claude(session_dir: Path) -> tuple[list[int], bool]:

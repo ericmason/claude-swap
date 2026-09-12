@@ -481,15 +481,20 @@ class TestIsClaudeArgv:
     def test_a_lookalike_script_is_not_claude(self):
         assert _classify_argv("node /opt/claude-helper") == ARGV_OTHER
 
-    @pytest.mark.parametrize("argv", [
-        "node worker.js /tmp/claude",
-        "node /srv/app/worker.mjs /tmp/claude",
-    ])
-    def test_a_worker_merely_passed_a_claude_path_is_not_a_main(self, argv):
+    def test_a_worker_merely_passed_a_claude_path_is_not_a_main(self):
         """A complete script name ends the script argument, so what follows is
         claude's own argv. Such a child inherits CLAUDE_CONFIG_DIR and can
         outlive its parent — reading it as a main pins the profile forever."""
+        argv = "node /srv/app/worker.mjs /tmp/claude"
         assert _classify_argv(argv) == ARGV_OTHER
+
+    def test_a_relative_worker_is_read_against_its_working_directory(self):
+        """`node worker.js` says nothing on its own: the same line names a
+        different file from every directory. With the process's cwd it resolves
+        and reads as not-a-main; without one it stays unknown."""
+        argv = "node worker.js /tmp/claude"
+        assert _classify_argv(argv, lambda: "/srv/app") == ARGV_OTHER
+        assert _classify_argv(argv) == ARGV_UNKNOWN
 
     def test_an_interpreter_flag_does_not_hide_the_script(self):
         assert _classify_argv("node --enable-source-maps /opt/app/server.js") == ARGV_OTHER
@@ -579,7 +584,7 @@ class TestArgvThatArrivesAlreadySeparated:
 
     @pytest.mark.parametrize("argv", [
         ["node", "-pe", "require('/opt/claude-code/cli.js')"],
-        ["node", "worker.js", "/opt/nm/@anthropic-ai/claude-code/cli.js"],
+        ["node", "/srv/worker.js", "/opt/nm/@anthropic-ai/claude-code/cli.js"],
         ["/bin/zsh", "-c", "ls"],
         ["vim", "/usr/local/bin/claude"],
         [],
@@ -678,7 +683,7 @@ class TestTheKernelIsTheSource:
 
 class TestScanEnvBoundClaude:
     def _ps(self, stdout, returncode=0, argv_out="", comm_out="", pids=(),
-            env_returncode=None):
+            env_returncode=None, uid_out=None):
         """Fake the three `ps` probes separately; they ask different questions.
 
         Leaving argv_out empty exercises the heuristic fallback, which is what
@@ -691,6 +696,8 @@ class TestScanEnvBoundClaude:
                 code = returncode if env_returncode is None else env_returncode
             elif argv[-1].endswith("comm="):
                 out = comm_out
+            elif argv[-1].endswith("uid="):
+                out = ("" if uid_out is None else uid_out)
             else:
                 out = argv_out
             return SimpleNamespace(stdout=out, returncode=code)
@@ -1055,7 +1062,7 @@ class TestTheCheapCheckComesFirst:
 
 
 class TestThePrefilterMayOnlyRuleOut:
-    """It runs before the real read, so a name it does not know must fall through."""
+    """It runs before the real read, so it must be a denylist, not an allowlist."""
 
     @pytest.mark.parametrize("executable", [
         "/Users/eric/.local/share/claude/versions/2.1.269",
@@ -1063,26 +1070,43 @@ class TestThePrefilterMayOnlyRuleOut:
         "/opt/homebrew/Cellar/node/26.0.0/bin/node",
         "/Users/me/Application Support/claude",
         "/usr/local/bin/claude",
+        "/opt/tools/assistant",
+        "/Users/e/bin/my-renamed-cli",
     ])
     def test_a_name_it_does_not_recognise_falls_through(self, executable):
-        """The native installer runs a VERSION-NAMED file behind a symlink, so
-        the basename is `2.1.269`. Ruling that out hid every real session on
-        this machine from the probe."""
-        from claude_swap.process_detection import _may_host_claude
+        """Recognising only claude-shaped names hid six of the eight real
+        sessions on this machine behind a version-named binary, and would hide
+        any install under a name nobody thought of. The prefilter may answer
+        only about programs it positively knows are something else."""
+        from claude_swap.process_detection import _known_not_claude
 
-        assert _may_host_claude(executable) is True
+        assert _known_not_claude(executable) is False
 
     @pytest.mark.parametrize("executable", [
         "/usr/bin/ssh",
         "/usr/libexec/logd",
         "/System/Library/PrivateFrameworks/X.framework/Support/mediaremoted",
+        "/bin/zsh",
+        "/opt/homebrew/bin/rg",
+        "/Applications/Safari.app/Contents/MacOS/Safari",
     ])
     def test_a_name_it_does_recognise_is_still_ruled_out(self, executable):
-        """The prefilter has to keep paying for itself: most of the process
-        table is settled here rather than by a megabyte read each."""
-        from claude_swap.process_detection import _may_host_claude
+        """The prefilter has to keep paying for itself, and these are the
+        programs a session starts and leaves behind as orphans."""
+        from claude_swap.process_detection import _known_not_claude
 
-        assert _may_host_claude(executable) is False
+        assert _known_not_claude(executable) is True
+
+    @pytest.mark.parametrize("executable", [
+        "/usr/bin/claude",
+        "/System/x/claude/versions/1.2.3",
+        "/bin/node",
+    ])
+    def test_a_sealed_location_cannot_rule_out_a_claude_shape(self, executable):
+        """Location is the weaker signal; a claude-shaped name wins over it."""
+        from claude_swap.process_detection import _known_not_claude
+
+        assert _known_not_claude(executable) is False
 
     def test_the_native_binary_is_recognised_as_the_cli_itself(self):
         from claude_swap.process_detection import _is_claude_binary
@@ -1105,6 +1129,32 @@ class TestThePrefilterMayOnlyRuleOut:
                  {"CLAUDE_CONFIG_DIR": str(d)})):
             fake_sys.platform = "darwin"
             assert scan_env_bound_claude(d) == ([4242], True)
+
+    def test_an_unrecognised_program_bound_to_the_profile_is_unknown(self, tmp_path):
+        """It may be a main under a name nobody listed, or a tool subprocess
+        that inherited the variable. Answering unbound rewrote credentials
+        under whichever it was."""
+        d = tmp_path / "1-acct"
+        env = {"CLAUDE_CONFIG_DIR": str(d)}
+        with structured(p4242=ProcArgs(["/opt/tools/assistant", "--serve"], env)):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_a_recognised_program_bound_to_the_profile_is_unbound(self, tmp_path):
+        """A zsh that inherited the variable is the common case by an order of
+        magnitude, and it outlives the session. Deferring on these would hold
+        every profile un-quiescent forever."""
+        d = tmp_path / "1-acct"
+        env = {"CLAUDE_CONFIG_DIR": str(d)}
+        with structured(p4242=ProcArgs(["/bin/zsh", "-c", "sleep 90"], env)):
+            assert scan_env_bound_claude(d) == ([], True)
+
+    def test_an_unrecognised_program_bound_elsewhere_is_still_unbound(self, tmp_path):
+        """The environment is conclusive in that direction whatever the
+        program is, which is what keeps the machine from deferring wholesale."""
+        d = tmp_path / "1-acct"
+        env = {"CLAUDE_CONFIG_DIR": "/somewhere/else"}
+        with structured(p4242=ProcArgs(["/opt/tools/assistant"], env)):
+            assert scan_env_bound_claude(d) == ([], True)
 
 
 class TestApplePsMarksUnreadableProcessesWithParentheses:
@@ -1206,6 +1256,8 @@ Options:
         type: size_t  default: 0
   --harmony (enable all completed harmony features)
         type: bool  default: --no-harmony
+  --enable-armv7 (enable ARMv7 instructions)
+        type: maybe_bool  default: unset
 """
 
     def test_aliases_on_one_line_share_one_arity(self):
@@ -1242,7 +1294,17 @@ Options:
 
         value, boolean = parse_v8_options(self.V8)
         assert value == {"--max-old-space-size"}
-        assert boolean == {"--harmony"}
+        assert boolean == {"--harmony", "--enable-armv7"}
+
+    def test_a_maybe_bool_option_swallows_nothing(self):
+        """V8's `maybe_bool` takes a value only when one is attached with `=`,
+        so filing it with the options that swallow the next token made
+        `node --enable-armv7 /opt/bin/claude` read as a main with no script."""
+        from claude_swap.node_help import parse_v8_options
+
+        value, boolean = parse_v8_options(self.V8)
+        assert "--enable-armv7" not in value
+        assert _classify_argv("node --enable-armv7 /opt/bin/claude") == ARGV_CLAUDE
 
     def test_the_shipped_tables_match_this_machines_node(self):
         """The tables are CLOSED, so a node upgrade that adds or re-types an
@@ -1284,3 +1346,114 @@ Options:
             f"{GENERATED_FROM}) list different options; missing={missing} "
             f"stale={stale}. Run tools/regen_node_options.py."
         )
+
+
+class TestAnInterpreterSubcommandIsNotTheScript:
+    """`bun run x.js` and `deno run x.js` put a word before the script."""
+
+    @pytest.mark.parametrize("argv", [
+        "bun run /opt/nm/@anthropic-ai/claude-code/cli.js",
+        "deno run /opt/nm/@anthropic-ai/claude-code/cli.js",
+        "bun x /opt/nm/@anthropic-ai/claude-code/cli.js",
+        "deno exec /opt/nm/@anthropic-ai/claude-code/cli.js",
+    ])
+    def test_a_subcommand_does_not_hide_the_script(self, argv):
+        """Reading `run` as the script filed these as not-a-main, so a live
+        session started through bun or deno had its credentials rewritten."""
+        assert _classify_argv(argv) == ARGV_CLAUDE
+
+    def test_node_has_no_subcommands(self):
+        """`node run` really does mean the file named `run`, so the path after
+        it is an argument to that script and not the script."""
+        argv = ["node", "run", "/opt/bin/claude"]
+        assert _classify_argv_tokens(argv, lambda: "/srv") == ARGV_OTHER
+
+
+class TestARelativeScriptIsReadAgainstTheProcessCwd:
+    """`node cli.js` names a different file from every directory."""
+
+    def test_a_relative_claude_entrypoint_resolves_to_a_main(self):
+        argv = ["node", "cli.js"]
+        cwd = "/opt/nm/@anthropic-ai/claude-code"
+        assert _classify_argv_tokens(argv, lambda: cwd) == ARGV_CLAUDE
+
+    def test_a_relative_script_with_no_cwd_is_unknown(self):
+        """Without the working directory there is no reading at all, and
+        "no reading" is never "not a main"."""
+        assert _classify_argv_tokens(["node", "cli.js"], lambda: None) == ARGV_UNKNOWN
+        assert _classify_argv_tokens(["node", "cli.js"]) == ARGV_UNKNOWN
+
+    def test_a_relative_script_bound_to_the_profile_defers(self, tmp_path):
+        """The environment names the profile and the script cannot be
+        resolved, so the pid has to defer rather than be called idle."""
+        d = tmp_path / "1-acct"
+        with structured(**{"4242": ProcArgs(
+                argv=["node", "cli.js"],
+                env={"CLAUDE_CONFIG_DIR": str(d)})}):
+            with patch("claude_swap.process_detection._proc_cwd",
+                       return_value=None):
+                assert scan_env_bound_claude(d) == ([], False)
+
+    def test_the_cwd_settles_that_same_pid(self, tmp_path):
+        d = tmp_path / "1-acct"
+        with structured(**{"4242": ProcArgs(
+                argv=["node", "cli.js"],
+                env={"CLAUDE_CONFIG_DIR": str(d)})}):
+            with patch("claude_swap.process_detection._proc_cwd",
+                       return_value="/opt/nm/@anthropic-ai/claude-code"):
+                assert scan_env_bound_claude(d) == ([4242], True)
+
+
+class TestAParenthesisedArgvIsAReadFailure:
+    """`ps` wraps the name in parentheses in argv too, not only in comm."""
+
+    def test_a_parenthesised_argv_is_not_a_program_name(self):
+        """`(claude)` in argv means the argument area was unreadable. Reading
+        it as a program name called a live main "not claude"."""
+        assert _classify_argv("(claude)") == ARGV_UNKNOWN
+        assert _classify_argv("(node) --enable-source-maps") == ARGV_UNKNOWN
+
+    def test_a_parenthesised_argv_bound_to_the_profile_defers(self, tmp_path):
+        d = tmp_path / "1-acct"
+        argv = "  4242 (claude)\n"
+        with TestScanEnvBoundClaude()._ps(
+                f"  4242 (claude) CLAUDE_CONFIG_DIR={d}\n",
+                argv_out=argv, comm_out="", pids=(4242,)):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_parentheses_inside_an_argument_are_left_alone(self):
+        """Only argv[0] is the program name; a shell one-liner may contain
+        anything."""
+        assert _classify_argv("/bin/zsh -c (echo hi)") == ARGV_OTHER
+
+
+class TestAnotherUsersProcessIsNotThisProfilesSession:
+    """A `claude` bound to a profile this tool manages runs as this user."""
+
+    def test_a_root_daemon_does_not_hold_the_profile_open(self, tmp_path):
+        """`ps` cannot show another user's environment, so every root daemon
+        on the machine answered "unknown" for good and no profile was ever
+        quiescent. Such a process is not the session about to be rewritten."""
+        d = tmp_path / "1-acct"
+        with TestScanEnvBoundClaude()._ps(
+                "", argv_out="  4242 /opt/telegraf/bin/telegraf\n",
+                comm_out="", pids=(4242,), uid_out="  4242 0\n"):
+            assert scan_env_bound_claude(d) == ([], True)
+
+    def test_this_users_unreadable_process_still_defers(self, tmp_path):
+        """Same shape, same missing environment — but it could be the user's
+        own session, so it has to defer."""
+        d = tmp_path / "1-acct"
+        with TestScanEnvBoundClaude()._ps(
+                "", argv_out="  4242 /opt/tools/assistant\n",
+                comm_out="", pids=(4242,),
+                uid_out=f"  4242 {os.getuid()}\n"):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_an_unreadable_owner_defers(self, tmp_path):
+        """No owner probe, no ruling out."""
+        d = tmp_path / "1-acct"
+        with TestScanEnvBoundClaude()._ps(
+                "", argv_out="  4242 /opt/tools/assistant\n",
+                comm_out="", pids=(4242,), uid_out=""):
+            assert scan_env_bound_claude(d) == ([], False)
