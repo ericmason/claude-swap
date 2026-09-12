@@ -1052,3 +1052,235 @@ class TestTheCheapCheckComesFirst:
              patch.object(pd, "_read_proc_args", side_effect=read):
             assert scan_env_bound_claude(d) == ([10], True)
         assert seen == [10]
+
+
+class TestThePrefilterMayOnlyRuleOut:
+    """It runs before the real read, so a name it does not know must fall through."""
+
+    @pytest.mark.parametrize("executable", [
+        "/Users/eric/.local/share/claude/versions/2.1.269",
+        "/opt/claude/versions/9.9.9",
+        "/opt/homebrew/Cellar/node/26.0.0/bin/node",
+        "/Users/me/Application Support/claude",
+        "/usr/local/bin/claude",
+    ])
+    def test_a_name_it_does_not_recognise_falls_through(self, executable):
+        """The native installer runs a VERSION-NAMED file behind a symlink, so
+        the basename is `2.1.269`. Ruling that out hid every real session on
+        this machine from the probe."""
+        from claude_swap.process_detection import _may_host_claude
+
+        assert _may_host_claude(executable) is True
+
+    @pytest.mark.parametrize("executable", [
+        "/usr/bin/ssh",
+        "/usr/libexec/logd",
+        "/System/Library/PrivateFrameworks/X.framework/Support/mediaremoted",
+    ])
+    def test_a_name_it_does_recognise_is_still_ruled_out(self, executable):
+        """The prefilter has to keep paying for itself: most of the process
+        table is settled here rather than by a megabyte read each."""
+        from claude_swap.process_detection import _may_host_claude
+
+        assert _may_host_claude(executable) is False
+
+    def test_the_native_binary_is_recognised_as_the_cli_itself(self):
+        from claude_swap.process_detection import _is_claude_binary
+
+        assert _is_claude_binary("/Users/e/.local/share/claude/versions/2.1.269")
+        assert _is_claude_binary("/usr/local/bin/claude")
+        assert not _is_claude_binary("/opt/homebrew/bin/node")
+
+    def test_a_version_named_claude_main_is_found_end_to_end(self, tmp_path):
+        """The whole point: the prefilter must not hide it from the scan."""
+        from claude_swap import process_detection as pd
+
+        d = tmp_path / "1-acct"
+        native = "/Users/e/.local/share/claude/versions/2.1.269"
+        with patch.object(pd, "_candidate_pids", return_value=[4242]), \
+             patch.object(pd, "_exec_path_macos", return_value=native), \
+             patch.object(pd, "sys") as fake_sys, \
+             patch.object(pd, "_read_proc_args", return_value=ProcArgs(
+                 ["/Users/e/.local/bin/claude", "--resume", "x"],
+                 {"CLAUDE_CONFIG_DIR": str(d)})):
+            fake_sys.platform = "darwin"
+            assert scan_env_bound_claude(d) == ([4242], True)
+
+
+class TestApplePsMarksUnreadableProcessesWithParentheses:
+    """`(claude)` is a read failure wearing the shape of an answer."""
+
+    def test_a_parenthesised_comm_is_not_a_program_name(self, tmp_path):
+        """Apple's `ps` prints the kernel's short name in parentheses when it
+        cannot read the argument area. Reading `(claude)` as a program name
+        called it "not claude" and reported the profile idle."""
+        d = tmp_path / "1-acct"
+        with TestScanEnvBoundClaude()._ps(
+                "", argv_out="", comm_out="  4242 (claude)\n", pids=(4242,)):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_an_unparenthesised_comm_still_settles_the_pid(self, tmp_path):
+        d = tmp_path / "1-acct"
+        with TestScanEnvBoundClaude()._ps(
+                "", argv_out="", comm_out="  4242 /usr/libexec/logd\n",
+                pids=(4242,)):
+            assert scan_env_bound_claude(d) == ([], True)
+
+
+class TestCommOutranksAFlattenedArgv:
+    """`comm` is one field, so a path with a space in it survives it intact."""
+
+    def test_a_native_main_under_a_spacey_path_is_not_called_idle(self, tmp_path):
+        """Flattened argv splits `/Users/me/Application Support/claude` into
+        two words and reads the first as the program, so argv says "not
+        claude" about a live main. `comm` kept the path whole and has to win."""
+        d = tmp_path / "1-acct"
+        comm = "  4242 /Users/me/Application Support/claude\n"
+        argv = "  4242 /Users/me/Application Support/claude --resume x\n"
+        with TestScanEnvBoundClaude()._ps(
+                f"{argv.rstrip()} CLAUDE_CONFIG_DIR={d}\n",
+                argv_out=argv, comm_out=comm, pids=(4242,)):
+            assert scan_env_bound_claude(d) == ([4242], True)
+
+    def test_an_interpreter_leaves_the_environment_to_settle_it(self, tmp_path):
+        """`comm` says node, which hosts anything, so argv's negative is too
+        weak to settle the pid — but an environment naming another profile is
+        conclusive whatever the program is, and that is what keeps every node
+        process on the machine from deferring."""
+        d = tmp_path / "1-acct"
+        comm = "  4242 /opt/homebrew/bin/node\n"
+        argv = "  4242 node /srv/worker.js\n"
+        with TestScanEnvBoundClaude()._ps(
+                f"  4242 node /srv/worker.js CLAUDE_CONFIG_DIR=/elsewhere\n",
+                argv_out=argv, comm_out=comm, pids=(4242,)):
+            assert scan_env_bound_claude(d) == ([], True)
+
+
+class TestEveryNegativeExitChecksTheGuess:
+    """Once a value has been consumed, no "not claude" from the walk is exact."""
+
+    @pytest.mark.parametrize("argv", [
+        "node -r hook -e /opt/bin/claude".replace(" ", " "),
+        "node -r hook --eval /opt/bin/claude",
+        "node -r /opt/bin/claude",
+        "node -r hook -",
+    ])
+    def test_an_early_exit_after_a_consumed_value_is_unknown(self, argv):
+        """`node -r "hook -e" /opt/bin/claude` is a real main whose hook path
+        held a space. The inline-code exit answered "not claude" outright and
+        never looked at the guess, so the main read as a one-liner."""
+        assert _classify_argv(argv) == ARGV_UNKNOWN
+
+    @pytest.mark.parametrize("argv", [
+        "node --eval code /opt/bin/claude",
+        "node -",
+        "node",
+    ])
+    def test_the_same_exits_stay_exact_without_a_guess(self, argv):
+        assert _classify_argv(argv) == ARGV_OTHER
+
+
+class TestTheNodeTablesAreDerivedNotTranscribed:
+    """Hand-maintained arity tables drifted, and drift here misreads a main."""
+
+    HELP = """\
+Usage: node [options] [ script.js ] [arguments]
+
+Options:
+  -                           script read from stdin
+  --                          indicate the end of node options
+  -c, --check                 syntax check script without executing
+  --loader, --experimental-loader=...
+                              use the specified module as a loader
+  --experimental-test-isolation, --test-isolation=...
+                              configures test isolation
+  --inspect[=[host:]port]     activate inspector on host:port
+  -p, --print [...]           evaluate script and print result
+  --disable-wasm-trap-handler Disable trap-handler-based WebAssembly
+  --tls-min-v1.2              set default TLS minimum to TLSv1.2
+"""
+
+    V8 = """\
+Options:
+  --max-old-space-size (max size of the old generation in MBytes)
+        type: size_t  default: 0
+  --harmony (enable all completed harmony features)
+        type: bool  default: --no-harmony
+"""
+
+    def test_aliases_on_one_line_share_one_arity(self):
+        """`--loader, --experimental-loader=...` marks the value on the LAST
+        spelling only. Reading each token alone filed `--loader` as taking no
+        value, so it swallowed nothing and its value read as the script."""
+        from claude_swap.node_help import parse_node_help
+
+        value, boolean = parse_node_help(self.HELP)
+        assert "--loader" in value and "--experimental-loader" in value
+        assert "--experimental-test-isolation" in value
+        assert "--test-isolation" in value
+
+    def test_an_attached_only_value_consumes_no_token(self):
+        """`--inspect[=port]` takes a value only when attached, so it must not
+        be filed with the options that swallow the token after them."""
+        from claude_swap.node_help import parse_node_help
+
+        value, boolean = parse_node_help(self.HELP)
+        assert "--inspect" in boolean and "--inspect" not in value
+        assert "--print" in value          # `-p, --print [...]` is detached
+
+    def test_a_description_one_space_away_is_not_read_as_an_option(self):
+        from claude_swap.node_help import parse_node_help
+
+        value, boolean = parse_node_help(self.HELP)
+        assert "--disable-wasm-trap-handler" in boolean
+        assert "--tls-min-v1.2" in boolean
+        assert not any(n.startswith("--Disable") for n in value | boolean)
+        assert "-" not in value | boolean and "--" not in value | boolean
+
+    def test_v8_types_decide_arity(self):
+        from claude_swap.node_help import parse_v8_options
+
+        value, boolean = parse_v8_options(self.V8)
+        assert value == {"--max-old-space-size"}
+        assert boolean == {"--harmony"}
+
+    def test_the_shipped_tables_match_this_machines_node(self):
+        """The tables are CLOSED, so a node upgrade that adds or re-types an
+        option has to surface as a failure here rather than as a wrong answer
+        about a live session. Regenerate with
+        `uv run python tools/regen_node_options.py`."""
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        if _shutil.which("node") is None:
+            pytest.skip("no node on this machine")
+
+        from claude_swap._node_options import (
+            GENERATED_FROM, NODE_BOOLEAN_FLAGS, NODE_VALUE_FLAGS,
+        )
+        from claude_swap.node_help import parse_node_help, parse_v8_options
+
+        def run(*argv):
+            p = _subprocess.run(argv, capture_output=True, text=True)
+            return p.stdout + p.stderr
+
+        version = run("node", "--version").strip()
+        hv, hb = parse_node_help(run("node", "--help"))
+        vv, vb = parse_v8_options(run("node", "--v8-options"))
+        value, boolean = hv | vv, (hb | vb) - (hv | vv)
+
+        misfiled = sorted((value & NODE_BOOLEAN_FLAGS) | (boolean & NODE_VALUE_FLAGS))
+        missing = sorted((value | boolean) - NODE_VALUE_FLAGS - NODE_BOOLEAN_FLAGS)
+        stale = sorted((NODE_VALUE_FLAGS | NODE_BOOLEAN_FLAGS) - value - boolean
+                       - {"-C", "-r", "-c", "-h", "-i", "-v"})
+        assert not misfiled, (
+            f"node {version} disagrees with the shipped tables (generated from "
+            f"{GENERATED_FROM}) about these options: {misfiled}. An option on "
+            "the wrong side either swallows a main's script argument or leaves "
+            "its value looking like one. Run tools/regen_node_options.py."
+        )
+        assert not missing and not stale, (
+            f"node {version} and the shipped tables (generated from "
+            f"{GENERATED_FROM}) list different options; missing={missing} "
+            f"stale={stale}. Run tools/regen_node_options.py."
+        )

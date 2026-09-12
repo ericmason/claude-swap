@@ -13,12 +13,14 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
+from claude_swap._node_options import NODE_BOOLEAN_FLAGS, NODE_VALUE_FLAGS
 from claude_swap.paths import get_claude_config_home
 
 logger = logging.getLogger(__name__)
@@ -241,96 +243,28 @@ _SCRIPT_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".py")
 # as a whole path segment so an unrelated `/home/claude-code-notes/x.js` misses.
 _CLAUDE_PACKAGE = re.compile(r"/claude-code/")
 
-# Interpreter options, split by what they do to the token after them. The
-# lists are transcribed from `node --help` (v26) and `python --help`, and they
-# are deliberately CLOSED: an option in neither list is not assumed harmless,
-# because assuming wrongly reads a real main's script argument as an option's
-# value and reports a live profile as idle. `--inspect-port 0 /opt/bin/claude`
-# did exactly that. Anything unlisted makes the argv unknown, which fails
-# closed — a deferred re-seed rather than a logout.
+# Interpreter options, split by what they do to the token after them. The node
+# tables are GENERATED from `node --help` and `node --v8-options` by
+# tools/regen_node_options.py, never transcribed: hand-maintaining them left
+# `--inspect-port` and `--diagnostic-dir` out and filed
+# `--experimental-test-isolation` as taking no value when it takes one, and
+# each of those misreads a live main. A test diffs the shipped tables against
+# the `node` on the machine running it, so a node upgrade shows up as a test
+# failure rather than as a wrong answer.
+#
+# The tables are also CLOSED: an option in neither list is not assumed
+# harmless, because assuming wrongly reads a real main's script argument as an
+# option's value and reports a live profile as idle. Anything unlisted makes
+# the argv unknown, which fails closed — a deferred re-seed rather than a
+# logout.
 #
 # A flag written `--opt=value` is self-contained whatever it means, so it never
 # reaches the lists and never makes anything unknown.
-_NODE_VALUE_FLAGS = frozenset({
-    "-C", "-r",
-    "--allow-fs-read", "--allow-fs-write", "--build-sea",
-    "--build-snapshot-config", "--conditions", "--cpu-prof-dir",
-    "--cpu-prof-interval", "--cpu-prof-name", "--debug-port",
-    "--diagnostic-dir", "--disable-proto", "--disable-warning",
-    "--dns-result-order", "--env-file", "--env-file-if-exists",
-    "--experimental-config-file", "--experimental-loader",
-    "--experimental-sea-config", "--heap-prof-dir", "--heap-prof-interval",
-    "--heap-prof-name", "--heapsnapshot-near-heap-limit",
-    "--heapsnapshot-signal", "--icu-data-dir", "--import", "--input-type",
-    "--inspect-port", "--inspect-publish-uid", "--loader",
-    "--localstorage-file", "--max-http-header-size", "--max-old-space-size",
-    "--max-old-space-size-percentage",
-    "--network-family-autoselection-attempt-timeout", "--openssl-config",
-    "--redirect-warnings", "--report-dir", "--report-directory",
-    "--report-filename", "--report-signal", "--require", "--run",
-    "--secure-heap", "--secure-heap-min", "--snapshot-blob",
-    "--test-concurrency", "--test-coverage-branches",
-    "--test-coverage-exclude", "--test-coverage-functions",
-    "--test-coverage-include", "--test-coverage-lines",
-    "--test-global-setup", "--test-isolation", "--test-name-pattern",
-    "--test-reporter", "--test-reporter-destination",
-    "--test-rerun-failures", "--test-shard", "--test-skip-pattern",
-    "--test-timeout", "--title", "--tls-cipher-list", "--tls-keylog",
-    "--trace-event-categories", "--trace-event-file-pattern",
-    "--trace-require-module", "--unhandled-rejections", "--use-largepages",
-    "--v8-pool-size", "--watch-kill-signal", "--watch-path",
-})
-
-_NODE_BOOL_FLAGS = frozenset({
-    "-c", "-h", "-i", "-v",
-    "--abort-on-uncaught-exception", "--allow-addons", "--allow-child-process",
-    "--allow-inspector", "--allow-net", "--allow-wasi", "--allow-worker",
-    "--build-snapshot", "--check", "--completion-bash", "--cpu-prof",
-    "--disable-sigusr1", "--disable-wasm-trap-handler",
-    "--disallow-code-generation-from-strings", "--enable-etw-stack-walking",
-    "--enable-fips", "--enable-network-family-autoselection",
-    "--enable-source-maps", "--entry-url", "--expose-gc",
-    "--force-context-aware", "--force-fips",
-    "--force-node-api-uncaught-exceptions-policy", "--frozen-intrinsics",
-    "--heap-prof", "--help", "--insecure-http-parser", "--inspect",
-    "--inspect-brk", "--inspect-wait", "--interactive",
-    "--interpreted-frames-native-stack", "--jitless", "--node-memory-debug",
-    "--openssl-legacy-provider", "--openssl-shared-config",
-    "--pending-deprecation", "--permission", "--permission-audit",
-    "--preserve-symlinks", "--preserve-symlinks-main", "--prof",
-    "--prof-process", "--report-compact", "--report-exclude-env",
-    "--report-exclude-network", "--report-on-fatalerror", "--report-on-signal",
-    "--report-uncaught-exception", "--require-module", "--test",
-    "--test-force-exit", "--test-only", "--test-update-snapshots",
-    "--throw-deprecation", "--tls-max-v1", "--tls-min-v1",
-    "--trace-deprecation", "--trace-env", "--trace-env-js-stack",
-    "--trace-env-native-stack", "--trace-exit", "--trace-promises",
-    "--trace-sigint", "--trace-sync-io", "--trace-tls", "--trace-uncaught",
-    "--trace-warnings", "--track-heap-objects", "--use-bundled-ca",
-    "--use-env-proxy", "--use-openssl-ca", "--use-system-ca", "--v8-options",
-    "--version", "--watch", "--watch-preserve-output", "--webstorage",
-    "--zero-fill-buffers",
-} | {f for f in (
-    # Every `--no-` negation node accepts is a boolean by construction.
-    "--no-addons", "--no-async-context-frame", "--no-deprecation",
-    "--no-experimental-detect-module", "--no-experimental-global-navigator",
-    "--no-experimental-repl-await", "--no-experimental-require-module",
-    "--no-experimental-sqlite", "--no-experimental-websocket",
-    "--no-experimental-webstorage", "--no-extra-info-on-fatal-exception",
-    "--no-force-async-hooks-checks", "--no-global-search-paths",
-    "--no-network-family-autoselection", "--no-require-module",
-    "--no-strip-types", "--no-warnings",
-)} | {f for f in (
-    # Experimental gates, all boolean.
-    "--experimental-addon-modules", "--experimental-default-config-file",
-    "--experimental-eventsource", "--experimental-import-meta-resolve",
-    "--experimental-inspector-network-resource",
-    "--experimental-network-inspection", "--experimental-print-required-tla",
-    "--experimental-storage-inspection", "--experimental-stream-iter",
-    "--experimental-strip-types", "--experimental-test-coverage",
-    "--experimental-test-isolation", "--experimental-test-module-mocks",
-    "--experimental-vm-modules", "--experimental-worker-inspection",
-)})
+#
+# The short aliases are added here because `node --help` prints them beside
+# their long spellings rather than as entries of their own.
+_NODE_VALUE_FLAGS = NODE_VALUE_FLAGS | frozenset({"-C", "-r"})
+_NODE_BOOL_FLAGS = NODE_BOOLEAN_FLAGS | frozenset({"-c", "-h", "-i", "-v"})
 
 # Options whose value IS the program. There is no script argument after one of
 # these, so every remaining token is argv for the inline code: `node --eval
@@ -383,16 +317,70 @@ def _interpreter_family(argv0: str) -> str | None:
     return match.group(1) if match else None
 
 
+# The native installer runs the CLI from a VERSION-NAMED file — on this
+# machine `~/.local/share/claude/versions/2.1.269`, reached through a
+# `~/.local/bin/claude` symlink — so the running executable's basename is a
+# version number and nothing about it says "claude". Recognising only the
+# literal basename ruled out every real session on this Mac.
+_CLAUDE_PATH_PART = re.compile(r"(?:^|/)claude(?:/|$)")
+_CLAUDE_VERSIONS = re.compile(r"(?:^|/)claude/versions/")
+_VERSION_NAME = re.compile(r"^[0-9][0-9A-Za-z._+-]*$")
+
+_claude_binary: str | None = None
+_claude_binary_tried = False
+
+
+def _native_claude_binary() -> str | None:
+    """The real file behind `claude` on PATH, or None when it cannot be found.
+
+    `which claude` may land on a wrapper script rather than the CLI — the
+    CodeToGo shim on this machine is one — so this is a hint that ADDS
+    recognition, never one the prefilter depends on.
+    """
+    global _claude_binary, _claude_binary_tried
+    if _claude_binary_tried:
+        return _claude_binary
+    _claude_binary_tried = True
+    found = shutil.which("claude")
+    if found is not None:
+        _claude_binary = os.path.realpath(found)
+    return _claude_binary
+
+
+def _is_claude_binary(executable: str) -> bool:
+    """Whether this executable IS the CLI, rather than something hosting it.
+
+    Stronger than :func:`_may_host_claude`: an interpreter may host a main and
+    may host anything else, but this answers yes only for the CLI itself, so a
+    yes settles the process without reading argv at all.
+    """
+    return (os.path.basename(executable) == "claude"
+            or executable == _native_claude_binary()
+            or _CLAUDE_VERSIONS.search(executable) is not None)
+
+
 def _may_host_claude(executable: str) -> bool:
     """Whether a main could be running under this executable.
 
-    A `claude` main is either the binary itself or one an interpreter is
-    hosting, so an executable that is neither rules the process out without
-    reading anything else. Used as the cheap prefilter before the expensive
-    per-process read.
+    This is a prefilter, so it may only rule a process OUT, and only on a name
+    it recognises. False means "this is positively some other program"; an
+    executable whose shape this function does not know returns True and is
+    settled by the full argv and environment read instead. Answering False on
+    an unfamiliar name is how the version-named native binary came to hide
+    every real session on this machine.
+
+    Four shapes count as possibly-claude: the literal `claude` basename, an
+    interpreter that could be hosting the CLI, a path with a `claude`
+    component, and a version-named file, which is what the native installer
+    produces and is indistinguishable from any other product's versioned
+    launcher.
     """
     base = os.path.basename(executable)
-    return base == "claude" or _INTERPRETER.match(base) is not None
+    return (base == "claude"
+            or _INTERPRETER.match(base) is not None
+            or _VERSION_NAME.match(base) is not None
+            or _CLAUDE_PATH_PART.search(os.path.dirname(executable)) is not None
+            or executable == _native_claude_binary())
 
 
 def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str] | None:
@@ -483,21 +471,21 @@ def _split_argv_env(rest: str, plain_argv: str | None) -> tuple[str, str | None]
     return rest[: split.start()], rest[split.start():]
 
 
-def _classify_argv(argv: str) -> str:
-    """Classify a FLATTENED argv line: claude, other, or unknown.
+def _walk_flattened(argv: str) -> tuple[str, bool]:
+    """One pass over a flattened argv line: ``(verdict, guessed)``.
 
-    `ps` joins arguments with spaces and quotes nothing, so this cannot always
-    tell one argument from two. Where it cannot, it says so. A Bash-tool shell
-    inherits CLAUDE_CONFIG_DIR from the claude that spawned it and can outlive
-    it as an orphan (64 such strays against one profile here, versus 7 real
-    mains), so binding on the variable alone would hold a profile
-    un-quiescent forever. The program is the honest test.
+    ``guessed`` records that the walk consumed an option's value by taking one
+    whitespace-separated word. A value holding a space leaves its tail behind,
+    so from that point on every token's position is a guess and no NEGATIVE
+    verdict from this walk can be trusted. The caller acts on that; keeping it
+    out of here is what stops a new early exit from forgetting to.
     """
+    guessed = False
     tokens = argv.split()
     if not tokens:
-        return ARGV_OTHER
-    if os.path.basename(tokens[0]) == "claude":
-        return ARGV_CLAUDE
+        return ARGV_OTHER, guessed
+    if _is_claude_binary(tokens[0]):
+        return ARGV_CLAUDE, guessed
     # Non-native installs reach the CLI through an interpreter, so the binary
     # is not argv[0]: `node /path/to/claude`. Only the SCRIPT position counts.
     # Scanning every argument instead would read `vim /usr/local/bin/claude`
@@ -510,10 +498,9 @@ def _classify_argv(argv: str) -> str:
     # was handed the entrypoint's path, not the entrypoint running.
     family = _interpreter_family(tokens[0])
     if family is None:
-        return ARGV_OTHER
+        return ARGV_OTHER, guessed
     table = _FLAG_TABLES[family]
     rest = argv.split(None, 1)[1] if len(tokens) > 1 else ""
-    guessed = False
     while rest.startswith("-"):
         parts = rest.split(None, 1)
         flag, remainder = parts[0], (parts[1] if len(parts) > 1 else "")
@@ -521,20 +508,18 @@ def _classify_argv(argv: str) -> str:
             # The program comes from stdin, so there is no script path and no
             # claude. Every interpreter here spells it the same way, and it is
             # not an option, so the unknown-option rule must not catch it.
-            return ARGV_OTHER
+            return ARGV_OTHER, guessed
         if flag == "--":
             rest = remainder
             break                   # end of options; the script is next
         base = flag.split("=", 1)[0]
         if base in table.inline or (
                 table.cluster is not None and table.cluster.match(base)):
-            return ARGV_OTHER       # inline code, so no script argument at all
+            # Inline code, so there is no script argument at all.
+            return ARGV_OTHER, guessed
         if "=" in flag:
             pass                    # self-contained, consumes nothing
         elif base in table.value:
-            # The value may itself have held a space, in which case only its
-            # first word is being dropped here and the rest still looks like
-            # argv. Remember that the walk is no longer exact.
             after = remainder.split(None, 1)
             remainder = after[1] if len(after) > 1 else ""
             guessed = True
@@ -543,14 +528,14 @@ def _classify_argv(argv: str) -> str:
             # reads a real main's script argument as an option's value;
             # assuming it takes one swallows the script. Neither is a guess
             # worth making under a credential rewrite.
-            return ARGV_UNKNOWN
+            return ARGV_UNKNOWN, guessed
         rest = remainder
     script = rest
     if not script:
-        return ARGV_OTHER
+        return ARGV_OTHER, guessed
     first = script.split(None, 1)[0]
-    if os.path.basename(first) == "claude" or _CLAUDE_PACKAGE.search(first):
-        return ARGV_CLAUDE
+    if _is_claude_binary(first) or _CLAUDE_PACKAGE.search(first):
+        return ARGV_CLAUDE, guessed
     # A first token that already looks like a complete script name ENDS the
     # script argument, so everything after it is claude's own argv rather than
     # more of the path: `node worker.js /tmp/claude` is a worker holding a
@@ -564,19 +549,35 @@ def _classify_argv(argv: str) -> str:
     # its own — otherwise `node worker.js .../claude-code/cli.js` reads as the
     # entrypoint when it is a worker holding the entrypoint's path.
     if not complete and _CLAUDE_PACKAGE.search(script):
-        return ARGV_CLAUDE
-    if guessed:
-        # A token here may be the tail of a consumed value rather than the
-        # script, so a negative verdict would be a guess.
-        return ARGV_UNKNOWN
+        return ARGV_CLAUDE, guessed
     if complete:
-        return ARGV_OTHER
+        return ARGV_OTHER, guessed
     # Otherwise the script path may simply contain spaces (`node
     # "/Users/me/Application Support/claude"`), where splitting yields
     # `/Users/me/Application` and rejects a live main. Only the path's tail is
     # needed to recognise it, and the tail has no space in it.
-    return (ARGV_CLAUDE if _SCRIPT_TAIL.search(script)
-            else ARGV_OTHER)
+    return ((ARGV_CLAUDE if _SCRIPT_TAIL.search(script) else ARGV_OTHER),
+            guessed)
+
+
+def _classify_argv(argv: str) -> str:
+    """Classify a FLATTENED argv line: claude, other, or unknown.
+
+    `ps` joins arguments with spaces and quotes nothing, so this cannot always
+    tell one argument from two. Where it cannot, it says so. A Bash-tool shell
+    inherits CLAUDE_CONFIG_DIR from the claude that spawned it and can outlive
+    it as an orphan (64 such strays against one profile here, versus 7 real
+    mains), so binding on the variable alone would hold a profile
+    un-quiescent forever. The program is the honest test.
+
+    Every negative verdict passes through the one check below. Once the walk
+    has consumed an option value it cannot place the tokens after it, so a
+    "not claude" from that point is a guess and becomes unknown — including
+    from the walk's early exits, which used to answer "not claude" outright
+    and so let `node -r "hook -e" /opt/bin/claude` read as inline code.
+    """
+    verdict, guessed = _walk_flattened(argv)
+    return ARGV_UNKNOWN if guessed and verdict == ARGV_OTHER else verdict
 
 
 class ProcArgs(NamedTuple):
@@ -599,7 +600,7 @@ def _classify_argv_tokens(argv: list[str]) -> str:
     """
     if not argv:
         return ARGV_OTHER
-    if os.path.basename(argv[0]) == "claude":
+    if _is_claude_binary(argv[0]):
         return ARGV_CLAUDE
     family = _interpreter_family(argv[0])
     if family is None:
@@ -627,8 +628,7 @@ def _classify_argv_tokens(argv: list[str]) -> str:
     if i >= len(argv):
         return ARGV_OTHER
     script = argv[i]
-    if (os.path.basename(script) == "claude"
-            or _CLAUDE_PACKAGE.search(script)):
+    if _is_claude_binary(script) or _CLAUDE_PACKAGE.search(script):
         return ARGV_CLAUDE
     return ARGV_OTHER
 
@@ -858,12 +858,25 @@ class _PsFallback:
     """
 
     def __init__(self) -> None:
-        combined = _pid_map(_ENV_PROBE_ARGV, "CLAUDE_CONFIG_DIR probe")
-        argvs = _pid_map(_ARGV_PROBE_ARGV, "argv probe")
-        executables = _pid_map(_COMM_PROBE_ARGV, "executable probe")
-        self.combined = combined
-        self.argvs = argvs
-        self.executables = executables
+        self.combined = _pid_map(_ENV_PROBE_ARGV, "CLAUDE_CONFIG_DIR probe")
+        self.argvs = _pid_map(_ARGV_PROBE_ARGV, "argv probe")
+        self.executables = _pid_map(_COMM_PROBE_ARGV, "executable probe")
+
+    def _executable(self, pid: int) -> str | None:
+        """This pid's executable path, or None when `ps` could not read it.
+
+        Apple's `ps` prints the kernel's short process name in PARENTHESES
+        when it cannot read the full argument area — `(claude)`, `(node)` —
+        and that is a read failure wearing the shape of an answer. Taking
+        `(claude)` for a program name ruled the process out as "not claude",
+        which is the exact inversion of what the marker means.
+        """
+        if self.executables is None:
+            return None
+        value = self.executables.get(pid)
+        if value is None or (value.startswith("(") and value.endswith(")")):
+            return None
+        return value
 
     def _argv_text(self, pid: int) -> str | None:
         """This pid's argv from whichever probe reported it, or None."""
@@ -879,14 +892,12 @@ class _PsFallback:
 
     def verdict(self, pid: int, target: str) -> str:
         """``bound``, ``unbound``, or ``unknown`` for one pid."""
-        executable = (None if self.executables is None
-                      else self.executables.get(pid))
+        executable = self._executable(pid)
         argv = self._argv_text(pid)
         if executable is not None and not _may_host_claude(executable):
-            # Positively read, and a main runs as either the binary or an
-            # interpreter, so this one cannot be a main. Most of the process
-            # table lands here; failing closed on all of it would wedge every
-            # profile on a machine with other users.
+            # Positively read, and recognised as some other program. Most of
+            # the process table lands here; failing closed on all of it would
+            # wedge every profile on a machine with other users.
             return _UNBOUND
         if argv is None:
             if not is_pid_alive(pid):
@@ -897,12 +908,21 @@ class _PsFallback:
                 return _UNBOUND
             return _UNKNOWN         # no trusted reading of this pid at all
         verdict = _classify_argv(argv)
+        if verdict == ARGV_OTHER and executable is not None:
+            # `comm` reports the executable as a single field, so it survives
+            # a path with a space in it that the flattened argv does not. Its
+            # reading outranks argv's: naming the CLI itself settles the pid as
+            # a main, and naming an interpreter leaves argv's "no" too weak to
+            # settle anything. That is how a native main under
+            # `/Users/me/Application Support/claude` came to read as idle.
+            verdict = (ARGV_CLAUDE if _is_claude_binary(executable)
+                       else ARGV_UNKNOWN)
         if verdict == ARGV_OTHER:
             return _UNBOUND
-        if verdict == ARGV_UNKNOWN:
-            return _UNKNOWN
         if self.combined is None or pid not in self.combined:
-            return _UNKNOWN         # a main, and no environment to read
+            # Either a main, or a pid argv could not place; no environment to
+            # settle it against either way.
+            return _UNKNOWN
         _, env = _split_argv_env(
             self.combined[pid],
             None if self.argvs is None else self.argvs.get(pid),
@@ -924,7 +944,16 @@ class _PsFallback:
             # The binding is there as a complete value, yet the parse read
             # something else — a later assignment-shaped word overwrote it.
             return _UNKNOWN
-        return _BOUND if value == target else _UNBOUND
+        if value != target:
+            # The environment settles it whatever the program turned out to
+            # be: a process bound to some other profile, or to none, is not
+            # bound to this one.
+            return _UNBOUND
+        # Bound to this profile. Report it as a main only if argv actually
+        # placed it as one; otherwise it may be a stray that merely inherited
+        # the variable, which is non-quiescent all the same but does not
+        # belong in a list of mains.
+        return _BOUND if verdict == ARGV_CLAUDE else _UNKNOWN
 
 
 def _scan_pid(pid: int, target: str) -> str:
