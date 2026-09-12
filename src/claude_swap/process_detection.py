@@ -7,15 +7,17 @@ currently running. Uses the same mechanism Claude Code itself uses internally.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 from claude_swap.paths import get_claude_config_home
 
@@ -190,6 +192,9 @@ _COMM_PROBE_ARGV = ("ps", "-Awwo", "pid=,comm=")
 # to eliminate.
 _ARGV_PROBE_ARGV = ("ps", "-Awwo", "pid=,command=")
 
+# Just the pids. Used to enumerate candidates where there is no /proc to list.
+_PID_PROBE_ARGV = ("ps", "-Ao", "pid=")
+
 # `ps ewwx` prints `PID argv... VAR=VAL VAR=VAL`, so argv ends at the first
 # env-shaped token. argv can hold its own `=` (`--model=x`, or a prompt saying
 # `FOO=bar`), which would cut it early -- harmless, because that only shortens
@@ -203,6 +208,20 @@ _ENV_PAIR = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_]*=")
 # a search for `CLAUDE_CONFIG_DIR=/p`, and with the value ended at whitespace,
 # a profile at `/p` matched a process whose profile was `/p old`.
 _ENV_ASSIGN = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=")
+
+_WHITESPACE = re.compile(r"\s")
+
+
+def _bound_text(target: str) -> re.Pattern[str]:
+    """`CLAUDE_CONFIG_DIR=<target>` as a complete assignment in flattened output.
+
+    Bounded at both ends: a sibling profile `<target>-old` does not satisfy the
+    right side, and `OTHER_CLAUDE_CONFIG_DIR=<target>` does not satisfy the
+    left.
+    """
+    return re.compile(
+        r"(?:^|\s)CLAUDE_CONFIG_DIR=" + re.escape(target) + r"(?=\s|$)"
+    )
 
 # Runtimes a non-native install can front the CLI with. Only these get their
 # script argument inspected; for anything else argv[0] is the whole test.
@@ -235,10 +254,23 @@ _VALUE_FLAGS = frozenset({
 # these, so every remaining token is argv for the inline code: `node --eval
 # 'setInterval(...)' /opt/bin/claude` holds a path, it does not run claude.
 # Kept apart from _VALUE_FLAGS, which merely consume a token and carry on.
-_EVAL_FLAGS = frozenset({"-e", "--eval", "-p", "--print"})
+_EVAL_LONG_FLAGS = frozenset({"--eval", "--print"})
+
+# Short options combine into one cluster, so the set of literal spellings is
+# open-ended: `-pe`, `-ep`, `-ipe` all mean eval. Matching the letters instead
+# of the spellings closes it. Only `e` and `p` are eval-bearing, and only in a
+# single-dash cluster — `--enable-source-maps` starts with a second dash and
+# `-r`/`-C` carry neither letter, so both stay out.
+_EVAL_SHORT_CLUSTER = re.compile(r"^-[a-zA-Z]*[ep][a-zA-Z]*$")
 
 
-def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str]:
+def _is_eval_flag(flag: str) -> bool:
+    """Whether an interpreter option replaces the script with inline code."""
+    base = flag.split("=", 1)[0]
+    return base in _EVAL_LONG_FLAGS or bool(_EVAL_SHORT_CLUSTER.match(base))
+
+
+def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str] | None:
     """pid -> trailing field, for a `ps` format whose last column is one value.
 
     The value is taken with ``partition`` rather than ``split``, so a path
@@ -256,9 +288,11 @@ def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str]:
         # profile_is_quiescent raising instead of answering, and take `cswap
         # run` down with it.
         logger.warning("%s failed (%s); continuing without it", label, exc)
-        return {}
+        return None
     if proc.returncode != 0:
-        return {}
+        logger.warning("%s exited %s; continuing without it",
+                       label, proc.returncode)
+        return None
     out: dict[int, str] = {}
     for line in proc.stdout.splitlines():
         head, _, value = line.strip().partition(" ")
@@ -271,32 +305,43 @@ def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str]:
 
 def _executables_by_pid() -> dict[int, str]:
     """pid -> executable path. Empty when the probe cannot run."""
-    return _pid_map(_COMM_PROBE_ARGV, "executable probe")
+    return _pid_map(_COMM_PROBE_ARGV, "executable probe") or {}
 
 
 def _argv_by_pid() -> dict[int, str]:
     """pid -> argv, with no environment appended. Empty when unavailable."""
-    return _pid_map(_ARGV_PROBE_ARGV, "argv probe")
+    return _pid_map(_ARGV_PROBE_ARGV, "argv probe") or {}
 
 
-def _env_pairs(env: str) -> dict[str, str]:
-    """Parse a flattened `ps` environment into ``{name: value}``.
+def _env_pairs(env: str) -> tuple[dict[str, str], bool]:
+    """Parse a flattened `ps` environment into ``({name: value}, ambiguous)``.
 
     Each value runs to the start of the next assignment rather than to the
     next space, so a value containing spaces survives and cannot be confused
     with a shorter one that is a prefix of it.
 
-    A value that itself contains an assignment-shaped word (``NOTE=a B=c``)
-    still splits at that word — flattened output carries no quoting, so the
-    ambiguity is in the data, not the parse. It costs a spurious extra name,
-    never a wrong value for the name this module reads.
+    The parse is a guess, because flattened output carries no quoting: a value
+    holding an assignment-shaped word (``NOTE=a B=c``) splits at that word, and
+    if the word reuses a name already seen the later fragment overwrites the
+    real value. That is not a cosmetic loss — a value containing the text
+    ``CLAUDE_CONFIG_DIR=/elsewhere`` would report this profile as UNBOUND and
+    let its credentials be rewritten under a live session.
+
+    So repetition is reported rather than resolved. ``ambiguous`` is True when
+    any name appears twice, and the caller must treat that pid's binding as
+    unknown. Callers that read a structured source instead — ``/proc`` or
+    ``KERN_PROCARGS2``, both NUL-separated — never reach this function.
     """
     marks = list(_ENV_ASSIGN.finditer(env))
     pairs: dict[str, str] = {}
+    ambiguous = False
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(env)
-        pairs[m.group(1)] = env[m.end():end]
-    return pairs
+        name = m.group(1)
+        if name in pairs:
+            ambiguous = True
+        pairs[name] = env[m.end():end]
+    return pairs, ambiguous
 
 
 def _is_claude_executable(executable: str | None) -> bool:
@@ -370,6 +415,12 @@ def _is_claude_argv(argv: str) -> bool:
     # non-quiescent forever.
     if first.endswith(_SCRIPT_SUFFIXES):
         return False
+    # The npm entrypoint under a path with a space in it arrives split, so its
+    # first token is a bare directory. The package segment is still in the
+    # remainder, and by now a worker holding that path has already been
+    # rejected by the suffix rule above, so only the entrypoint reaches here.
+    if _CLAUDE_PACKAGE.search(script):
+        return True
     # Otherwise the script path may simply contain spaces (`node
     # "/Users/me/Application Support/claude"`), where splitting yields
     # `/Users/me/Application` and rejects a live main. Only the path's tail is
@@ -398,7 +449,7 @@ def _interpreter_script(rest: str) -> str | None:
         parts = rest.split(None, 1)
         flag, remainder = parts[0], (parts[1] if len(parts) > 1 else "")
         base = flag.split("=", 1)[0]
-        if base in _EVAL_FLAGS:
+        if _is_eval_flag(base):
             # Inline code replaces the script. `--eval=CODE` carries its own
             # value; the separate form consumes the next token. Either way
             # nothing after this point is a script path.
@@ -410,78 +461,339 @@ def _interpreter_script(rest: str) -> str | None:
     return rest or None
 
 
+class ProcArgs(NamedTuple):
+    """A process's argv and environment, read from a structured source.
+
+    ``env`` is None when the OS showed the arguments but withheld the
+    environment — the Linux case, where ``/proc/<pid>/cmdline`` is world
+    readable and ``/proc/<pid>/environ`` is not. ``argv`` is empty only when
+    nothing at all could be read.
+    """
+
+    argv: list[str]
+    env: dict[str, str] | None
+
+
+def _split_nul_env(chunks: list[bytes]) -> dict[str, str]:
+    """NUL-separated ``NAME=VALUE`` records into a dict.
+
+    The separator is the kernel's, not a guess, so a value containing spaces,
+    newlines, or an ``=`` sign survives whole. That is the whole reason this
+    path exists beside the `ps` one.
+    """
+    env: dict[str, str] = {}
+    for chunk in chunks:
+        if not chunk:
+            continue
+        name, sep, value = chunk.partition(b"=")
+        if sep:
+            env.setdefault(name.decode("utf-8", "replace"),
+                           value.decode("utf-8", "replace"))
+    return env
+
+
+def _proc_args_linux(pid: int) -> ProcArgs | None:
+    """argv and environment from ``/proc/<pid>``, or None when the pid is gone."""
+    base = Path("/proc") / str(pid)
+    try:
+        raw_argv = (base / "cmdline").read_bytes()
+    except OSError:
+        return None
+    argv = [c.decode("utf-8", "replace") for c in raw_argv.split(b"\0") if c]
+    try:
+        raw_env = (base / "environ").read_bytes()
+    except OSError:
+        # Another user's process: the kernel shows argv and withholds environ.
+        return ProcArgs(argv, None)
+    return ProcArgs(argv, _split_nul_env(raw_env.split(b"\0")))
+
+
+def _load_libc() -> ctypes.CDLL | None:
+    """libc with ``sysctl`` bound, or None where it cannot be reached."""
+    try:
+        path = ctypes.util.find_library("c")
+        libc = ctypes.CDLL(path, use_errno=True)
+        libc.sysctl.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        libc.sysctl.restype = ctypes.c_int
+    except (OSError, AttributeError, TypeError) as exc:
+        logger.debug("libc sysctl unavailable: %r", exc)
+        return None
+    return libc
+
+
+_CTL_KERN = 1
+_KERN_ARGMAX = 8
+_KERN_PROCARGS2 = 49
+_libc: ctypes.CDLL | None = None
+_argmax: int | None = None
+
+
+def _sysctl(mib_values: list[int], size: int) -> bytes:
+    """One ``sysctl`` read into a fixed buffer. Raises OSError on refusal."""
+    assert _libc is not None
+    mib = (ctypes.c_int * len(mib_values))(*mib_values)
+    buf = ctypes.create_string_buffer(size)
+    length = ctypes.c_size_t(size)
+    if _libc.sysctl(mib, len(mib_values), buf, ctypes.byref(length),
+                    None, 0) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return buf.raw[:length.value]
+
+
+def _macos_argmax() -> int | None:
+    """The kernel's argument-area size, read once. None when unavailable."""
+    global _libc, _argmax
+    if _argmax is not None:
+        return _argmax
+    if _libc is None:
+        _libc = _load_libc()
+        if _libc is None:
+            return None
+    try:
+        _argmax = int.from_bytes(
+            _sysctl([_CTL_KERN, _KERN_ARGMAX], 4), sys.byteorder
+        )
+    except OSError as exc:
+        logger.debug("KERN_ARGMAX unavailable: %r", exc)
+        return None
+    return _argmax
+
+
+def _proc_args_macos(pid: int) -> ProcArgs | None:
+    """argv and environment from ``KERN_PROCARGS2``, or None when refused.
+
+    The kernel hands back ``argc``, the exec path, then argv and the
+    environment as NUL-separated records — the same bytes ``execve`` was
+    given. It refuses with EPERM for another user's process and for the
+    platform binaries macOS protects, and with EINVAL for a pid that has
+    already exited; all three are "unknown for this pid", never "unbound".
+    """
+    size = _macos_argmax()
+    if size is None:
+        return None
+    try:
+        raw = _sysctl([_CTL_KERN, _KERN_PROCARGS2, pid], size)
+    except OSError:
+        return None
+    if len(raw) < 5:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    rest = raw[4:]
+    end = rest.find(b"\0")
+    if end < 0:
+        return None
+    # The exec path is followed by alignment NULs before argv[0] starts.
+    i = end
+    while i < len(rest) and rest[i:i + 1] == b"\0":
+        i += 1
+    records = rest[i:].split(b"\0")
+    argv = [c.decode("utf-8", "replace") for c in records[:argc]]
+    return ProcArgs(argv, _split_nul_env(records[argc:]))
+
+
+def _read_proc_args(pid: int) -> ProcArgs | None:
+    """Structured argv and environment for one pid, or None when unreadable.
+
+    Structured means NUL-separated, straight from the kernel: no whitespace
+    splitting, so nothing here can confuse an argument with an environment
+    variable or a value with the value beside it. `ps` remains only as the
+    last resort for pids and platforms this cannot reach.
+    """
+    if sys.platform == "darwin":
+        return _proc_args_macos(pid)
+    if sys.platform.startswith("linux") and Path("/proc").is_dir():
+        return _proc_args_linux(pid)
+    return None
+
+
+def _candidate_pids() -> list[int] | None:
+    """Every pid on the machine, or None when they could not be listed."""
+    if sys.platform.startswith("linux") and Path("/proc").is_dir():
+        try:
+            return [int(n) for n in os.listdir("/proc") if n.isdigit()]
+        except OSError as exc:
+            logger.warning("Could not list /proc (%s); profile liveness is "
+                           "unknown", exc)
+            return None
+    listing = _pid_map(_PID_PROBE_ARGV, "pid probe")
+    if listing is None:
+        return None
+    return list(listing)
+
+
+def _interpreter_script_arg(rest: list[str]) -> str | None:
+    """The script argument among an interpreter's options, or None if there is none.
+
+    Exact, because the arguments arrive already separated: a script path
+    containing spaces is one token here, where the flattened `ps` form would
+    have split it and lost the main. Options that CONSUME a value are stepped
+    over; options that REPLACE the script with inline code end the search.
+    """
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        flag = rest[i]
+        if _is_eval_flag(flag):
+            return None
+        if "=" not in flag and flag in _VALUE_FLAGS:
+            i += 1
+        i += 1
+    return rest[i] if i < len(rest) else None
+
+
+def _is_claude_argv_tokens(argv: list[str]) -> bool:
+    """Whether an already-separated argv is a `claude` main.
+
+    The exact counterpart of :func:`_is_claude_argv`, which has to re-split a
+    flattened line and guess. Nothing here needs the suffix or tail
+    heuristics: the script argument is a single token, so
+    ``/Users/me/Application Support/nm/@anthropic-ai/claude-code/cli.js`` is
+    recognised whole instead of being cut at the space and read as a worker.
+    """
+    if not argv:
+        return False
+    if os.path.basename(argv[0]) == "claude":
+        return True
+    if os.path.basename(argv[0]) not in _SCRIPT_INTERPRETERS:
+        return False
+    script = _interpreter_script_arg(argv[1:])
+    if script is None:
+        return False
+    return (os.path.basename(script) == "claude"
+            or _CLAUDE_PACKAGE.search(script) is not None)
+
+
+class _PsFallback:
+    """Last-resort view of the process table, for pids no kernel source covers.
+
+    Everything `ps` prints is flattened and space-separated, so argv and the
+    environment run together and a value with a space in it is indistinguishable
+    from two values. That ambiguity is reported, never resolved: an
+    unresolvable pid makes the whole scan report "unknown", which fails closed.
+    """
+
+    def __init__(self) -> None:
+        combined = _pid_map(_ENV_PROBE_ARGV, "CLAUDE_CONFIG_DIR probe")
+        self.available = combined is not None
+        self.combined = combined or {}
+        self.argvs = _argv_by_pid()
+        self.executables = _executables_by_pid()
+
+    def verdict(self, pid: int, target: str) -> str:
+        """``"bound"``, ``"unbound"``, or ``"unknown"`` for one pid."""
+        rest = self.combined.get(pid)
+        argv = self.argvs.get(pid, "")
+        env: str | None = None
+        if rest is not None:
+            from_line, env = _split_argv_env(rest, self.argvs.get(pid))
+            # The combined line is the only argv source when the plain probe
+            # missed this pid. Its argv/env boundary is a guess, but argv is
+            # a PREFIX either way, so the binary in argv[0] is intact.
+            argv = argv or from_line
+        if not (_is_claude_executable(self.executables.get(pid))
+                or _is_claude_argv(argv)):
+            # Not a main under any reading, so its environment cannot bind
+            # this profile and no ambiguity in it matters. Most of the process
+            # table lands here; failing closed on all of it would wedge every
+            # profile on a machine with other users.
+            return "unbound"
+        if not env:
+            # argv with no environment after it: macOS withholds the
+            # environment of another user's process and of the platform
+            # binaries it protects. A claude main we cannot read is unknown.
+            return "unknown"
+        pairs, ambiguous = _env_pairs(env)
+        value = pairs.get("CLAUDE_CONFIG_DIR")
+        if ambiguous:
+            return "unknown"
+        if value is not None and _WHITESPACE.search(value):
+            # A value that reaches a space may have ended there or may not;
+            # the flattened form does not say which.
+            return "unknown"
+        if value != target and _bound_text(target).search(env):
+            # The binding is there as a complete value, yet the parse read
+            # something else — a later assignment-shaped word overwrote it.
+            # The split landed somewhere this function cannot vouch for.
+            return "unknown"
+        return "bound" if value == target else "unbound"
+
+
 def scan_env_bound_claude(session_dir: Path) -> tuple[list[int], bool]:
     """Live `claude` PIDs bound to ``session_dir``, and whether the probe ran.
 
-    Returns ``(pids, probed)``. ``probed`` is False when the OS could not be
-    asked at all: `ps` is absent, raised, timed out, or exited nonzero. The
-    caller must treat that as "unknown", not as "nobody is there" — the step
-    behind :func:`profile_is_quiescent` rewrites credentials, and doing that
-    under a session this probe simply failed to see is the mid-session logout
-    the probe was added to prevent. An empty list with ``probed`` True is the
-    only answer that means the profile is idle.
+    Returns ``(pids, probed)``. ``probed`` is False when liveness could not be
+    established for some pid that might be a claude main. The caller must treat
+    that as "unknown", not as "nobody is there" — the step behind
+    :func:`profile_is_quiescent` rewrites credentials, and doing that under a
+    session this probe failed to see is the mid-session logout the probe was
+    added to prevent. An empty list with ``probed`` True is the only answer
+    that means the profile is idle.
+
+    Each pid is read from a structured, NUL-separated source: ``/proc`` on
+    Linux, ``KERN_PROCARGS2`` on macOS. Those give argv and the environment as
+    the kernel holds them, so a path with a space in it stays one argument and
+    an environment value cannot be confused with the argument beside it.
+    `ps` is consulted only for pids those sources refuse, and an answer it
+    cannot give unambiguously counts as unknown rather than as a guess.
 
     The pid list is still a SUPPLEMENT to the session registry and may only
     ever ADD liveness it missed; the flag is what stops a broken probe from
     silently subtracting the signal instead.
 
-    Windows is the one exception, reported as ``(…, True)``: there is no cheap
-    environment read there, so the probe is not broken but absent. Failing
-    closed on it would leave every Windows profile permanently un-re-seedable,
-    which is a worse bargain than the registry alone.
+    Windows is the one exception, reported as ``(…, True)``. There is no cheap
+    environment read there, so this profile keeps the registry-only behavior
+    that shipped before this probe existed: an unregistered `claude --resume`
+    on Windows can still have its credentials rewritten underneath it. Failing
+    closed instead would leave every Windows profile permanently
+    un-re-seedable, which is the worse of the two.
     """
     if sys.platform == "win32":
         return [], True
-    if shutil.which("ps") is None:
-        logger.warning("CLAUDE_CONFIG_DIR probe unavailable (no `ps`); "
+
+    pids = _candidate_pids()
+    if pids is None:
+        logger.warning("CLAUDE_CONFIG_DIR probe could not list processes; "
                        "profile liveness is unknown")
         return [], False
 
-    try:
-        proc = subprocess.run(
-            _ENV_PROBE_ARGV, capture_output=True, text=True,
-            errors="replace", timeout=10
-        )
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        # See _executables_by_pid: ValueError is here for UnicodeDecodeError,
-        # which neither of the other two clauses covers. Raising out of the
-        # probe would break `cswap run` outright, so the failure is reported
-        # rather than raised.
-        logger.warning("CLAUDE_CONFIG_DIR probe failed (%s); profile liveness "
-                       "is unknown", exc)
-        return [], False
-    if proc.returncode != 0:
-        logger.warning("CLAUDE_CONFIG_DIR probe exited %s; profile liveness "
-                       "is unknown", proc.returncode)
-        return [], False
-
     target = str(session_dir)
-    executables = _executables_by_pid()
-    argvs = _argv_by_pid()
-    pids: list[int] = []
-    for line in proc.stdout.splitlines():
-        head, _, rest = line.strip().partition(" ")
-        try:
-            pid_candidate = int(head)
-        except ValueError:
+    bound: list[int] = []
+    probed = True
+    fallback: _PsFallback | None = None
+    for pid in pids:
+        info = _read_proc_args(pid)
+        if info is not None and info.env is not None:
+            if (info.env.get("CLAUDE_CONFIG_DIR") == target
+                    and _is_claude_argv_tokens(info.argv)):
+                bound.append(pid)
             continue
-        argv, env = _split_argv_env(rest, argvs.get(pid_candidate))
-        if env is None:
-            continue  # no environment visible (another user's process)
-        # Exact name, exact value. A sibling profile `<dir>-old` differs in the
-        # value and a variable merely ENDING in the name differs in the key,
-        # so neither can bind this directory.
-        if _env_pairs(env).get("CLAUDE_CONFIG_DIR") != target:
+        if info is not None:
+            # argv without the environment, the Linux other-user case. argv
+            # alone settles it whenever the process is not a main at all.
+            if not _is_claude_argv_tokens(info.argv):
+                continue
+            logger.debug("pid %s looks like a claude main but its environment "
+                         "is not readable", pid)
+            probed = False
             continue
-        pid = pid_candidate
-        # Executable first: it is space-safe. argv is the fallback that still
-        # catches an interpreter-hosted install, where the binary is `node` and
-        # only the script argument names claude.
-        if not (_is_claude_executable(executables.get(pid))
-                or _is_claude_argv(argv)):
-            continue
-        pids.append(pid)
-    return pids, True
+        if not is_pid_alive(pid):
+            continue  # exited between the listing and the read
+        if fallback is None:
+            fallback = _PsFallback()
+        answer = fallback.verdict(pid, target)
+        if answer == "bound":
+            bound.append(pid)
+        elif answer == "unknown":
+            logger.debug("pid %s could not be resolved for or against %s",
+                         pid, target)
+            probed = False
+    if not probed:
+        logger.warning("CLAUDE_CONFIG_DIR probe could not resolve every "
+                       "process; profile liveness is unknown")
+    return bound, probed
 
 
 def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:

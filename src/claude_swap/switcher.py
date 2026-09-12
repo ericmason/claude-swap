@@ -800,7 +800,7 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
-        if self._live_session_pids(account_num, email):
+        if self._session_profile_may_be_live(account_num, email):
             from claude_swap.session import mark_session_stale
 
             if not mark_session_stale(self._session_dir(account_num, email)):
@@ -2748,6 +2748,47 @@ class ClaudeAccountSwitcher:
 
         sessions, _ = scan_live_sessions(self._session_dir(account_num, email))
         return [s.pid for s in sessions]
+
+    def _session_profile_may_be_live(self, account_num: str, email: str) -> bool:
+        """Whether anything says a claude could be running on this profile.
+
+        The session registry alone is what missed the `claude --resume` main
+        behind the mid-session logout, so the CLAUDE_CONFIG_DIR probe is asked
+        too, and a probe that could not run counts as "may be live". This is
+        the guard side of the question :func:`profile_is_quiescent` answers for
+        bootstrap, and it fails closed for the same reason: the caller's other
+        branch deletes the profile's credential material, and doing that under
+        a live instance logs it out mid-conversation.
+
+        Distinct from :meth:`_live_session_pids`, which is scan-shaped and
+        feeds display and usage heuristics that want a PID list rather than a
+        verdict.
+        """
+        if self._live_session_pids(account_num, email):
+            return True
+        session_dir = self._session_dir(account_num, email)
+        if not session_dir.is_dir():
+            # No profile to run against, so nothing can be live in it — and
+            # the caller's other branch has nothing to invalidate either. The
+            # probe walks the whole process table, so this is worth skipping.
+            return False
+        from claude_swap.process_detection import scan_env_bound_claude
+
+        bound, probed = scan_env_bound_claude(session_dir)
+        if bound:
+            self._logger.debug(
+                "Account %s's session profile has %s unregistered live "
+                "instance(s); deferring credential invalidation.",
+                account_num, len(bound),
+            )
+            return True
+        if not probed:
+            self._logger.debug(
+                "Account %s's session profile could not be probed for live "
+                "instances; deferring credential invalidation.", account_num,
+            )
+            return True
+        return False
 
     def _ensure_no_live_session(self, account_num: str, email: str, action: str) -> None:
         """Refuse a destructive operation while a session-mode claude is live.
@@ -6389,7 +6430,17 @@ class ClaudeAccountSwitcher:
         # underneath us mid-process. Same bytes → same owner → no second call.
         cached = self._oracle_identity_cache
         if cached is not None and cached[0] == oauth.credential_fingerprint(live):
-            return cached[1]
+            if self._slot_holding_identity(cached[1], data)[1]:
+                return cached[1]
+            # It placed a slot when it was stored, and no longer does: the
+            # roster moved under it, as when a slot is removed and re-added
+            # without a uuid. Keeping it would replay an answer that can no
+            # longer be checked for the life of the credential, so it is
+            # dropped and the question asked again.
+            self._logger.debug(
+                "Cached live identity no longer places any slot; re-resolving."
+            )
+            self._oracle_identity_cache = None
 
         identity = self._get_current_account()
         config_slot = (

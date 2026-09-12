@@ -10,6 +10,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -1770,6 +1771,51 @@ class TestGuards:
                 "function that reports failure to nobody has not stopped "
                 "reporting success"
             )
+
+    @pytest.mark.parametrize("probe, expectation", [
+        (([7331], True), "an unregistered live main"),
+        (([], False), "a probe that could not run"),
+    ])
+    def test_backup_credential_write_defers_to_the_environment_probe(
+        self, seeded_switcher, probe, expectation
+    ):
+        """The registry is what missed the `claude --resume` main in the first
+        place, so the guard that DELETES a profile's credentials cannot trust
+        it alone. Both answers must defer: {expectation} leaves the live copy
+        alone and marks the profile stale for later."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("live session creds")
+        # Registry empty on purpose: no make_live() here.
+
+        with patch("claude_swap.process_detection.scan_env_bound_claude",
+                   return_value=probe):
+            seeded_switcher._write_account_credentials(
+                ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            )
+
+        assert (session_dir / ".credentials.json").read_text() == \
+            "live session creds", expectation
+        assert session_mod.is_session_stale(session_dir)
+
+    def test_a_quiet_profile_is_still_invalidated_outright(self, seeded_switcher):
+        """The guard must not become a permanent deferral: with the registry
+        empty AND the probe clean, the credentials still go."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("idle session creds")
+
+        with patch("claude_swap.process_detection.scan_env_bound_claude",
+                   return_value=([], True)):
+            seeded_switcher._write_account_credentials(
+                ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            )
+
+        assert not (session_dir / ".credentials.json").exists()
 
     def test_list_skips_refresh_for_live_session_accounts(
         self, seeded_switcher, monkeypatch

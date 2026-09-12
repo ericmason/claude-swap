@@ -338,6 +338,32 @@ class TestAnIdentityTooPartialToPlaceIsNotCached:
             assert _live_slot(s, NO_UUIDS) == "1"
             assert prefetch.call_count == 2
 
+    def test_a_cached_identity_that_stops_placing_a_slot_is_re_asked(
+        self, temp_home, mock_claude_config,
+    ):
+        """Conclusiveness is a property of the identity AND the roster, and
+        only the identity is cached. Remove slot 1 and re-add it without a
+        uuid — `cswap add-token` does exactly that — and the stored answer can
+        no longer be checked against anything. Replaying it would keep the
+        wrong slot marked active until the credential itself rotated."""
+        s = _drifted(temp_home, mock_claude_config)
+        with patch.object(s, "_read_active_credentials",
+                          return_value=_active(CREDS_LIVE)), \
+             patch.object(s, "_read_credentials", return_value=CREDS_LIVE), \
+             patch.object(s, "_read_account_credentials", return_value=CREDS_SLOT2), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=PROFILE_UUID_ONLY) as fetch:
+            # First, with uuids on the slots, the uuid-only answer places one.
+            assert _live_slot(s, SEQUENCE) == "1"
+            assert s._oracle_identity_cache is not None
+
+            # Slot 1 is re-added without a uuid; the cached answer now places
+            # nothing, so it must not be handed back.
+            s._write_json(s.sequence_file, NO_UUIDS)
+            assert _live_slot(s, NO_UUIDS) is None
+            assert s._oracle_identity_cache is None
+            assert fetch.call_count == 2, "the second call re-asked"
+
     def test_a_placeable_identity_is_still_cached(
         self, temp_home, mock_claude_config,
     ):
