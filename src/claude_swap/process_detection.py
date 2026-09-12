@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -349,8 +350,15 @@ _CLAUDE_PATH_PART = re.compile(r"(?:^|/)claude(?:/|$)")
 _CLAUDE_VERSIONS = re.compile(r"(?:^|/)claude/versions/")
 _VERSION_NAME = re.compile(r"^[0-9][0-9A-Za-z._+-]*$")
 
-_claude_binary: str | None = None
-_claude_binary_tried = False
+# The resolved binary and the fact that it was resolved are ONE value, a
+# single-element tuple, so publishing them is one assignment and a reader can
+# never see "already looked" without the answer that look produced. Two
+# separate variables let a second thread arrive between the flag and the
+# value, read None, and classify a live native main as not-the-CLI: the
+# menubar refresh thread and the CLI run this concurrently, and the window is
+# a `shutil.which` PATH walk wide.
+_claude_binary_cache: tuple[str | None] | None = None
+_claude_binary_lock = threading.Lock()
 
 
 def _native_claude_binary() -> str | None:
@@ -359,15 +367,23 @@ def _native_claude_binary() -> str | None:
     `which claude` may land on a wrapper script rather than the CLI — the
     CodeToGo shim on this machine is one — so this is a hint that ADDS
     recognition, never one the prefilter depends on.
+
+    Resolved once and cached. The lock keeps concurrent callers from each
+    walking PATH; the single-assignment publish above is what keeps them from
+    reading a half-initialised answer.
     """
-    global _claude_binary, _claude_binary_tried
-    if _claude_binary_tried:
-        return _claude_binary
-    _claude_binary_tried = True
-    found = shutil.which("claude")
-    if found is not None:
-        _claude_binary = os.path.realpath(found)
-    return _claude_binary
+    global _claude_binary_cache
+    cached = _claude_binary_cache
+    if cached is not None:
+        return cached[0]
+    with _claude_binary_lock:
+        cached = _claude_binary_cache
+        if cached is not None:
+            return cached[0]
+        found = shutil.which("claude")
+        resolved = None if found is None else os.path.realpath(found)
+        _claude_binary_cache = (resolved,)
+        return resolved
 
 
 def _is_claude_binary(executable: str) -> bool:

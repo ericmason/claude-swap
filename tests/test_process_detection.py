@@ -1615,3 +1615,91 @@ class TestAWritableLocationIsRuledOutOnlyOnArgv:
                          ["/Library/Acme/assistant", "--serve"],
                          {"CLAUDE_CONFIG_DIR": str(d)}):
             assert scan_env_bound_claude(d) == ([], True)
+
+
+class TestTheResolvedBinaryIsPublishedWhole:
+    """Two threads reach this cache: the CLI and the menubar refresh."""
+
+    @staticmethod
+    def _reset():
+        from claude_swap import process_detection as pd
+
+        pd._claude_binary_cache = None
+
+    def test_a_concurrent_caller_never_sees_a_half_built_cache(self):
+        """Setting the "already looked" flag before the answer let a second
+        thread arrive in between, read None, and classify a live native main
+        as not the CLI. The window is a `shutil.which` PATH walk wide, and the
+        consequence is a running session's credentials rewritten."""
+        import threading
+        from claude_swap import process_detection as pd
+
+        native = "/Users/e/.local/bin/claude-real"
+        started = threading.Barrier(9)
+
+        def slow_which(_name):
+            time.sleep(0.05)        # the PATH walk this cache exists to avoid
+            return native
+
+        answers = []
+
+        def ask():
+            started.wait()
+            answers.append(pd._is_claude_binary(native))
+
+        self._reset()
+        try:
+            with patch.object(pd.shutil, "which", side_effect=slow_which), \
+                 patch.object(pd.os.path, "realpath", side_effect=lambda p: p):
+                threads = [threading.Thread(target=ask) for _ in range(8)]
+                for t in threads:
+                    t.start()
+                started.wait()
+                for t in threads:
+                    t.join()
+        finally:
+            self._reset()
+
+        assert len(answers) == 8
+        assert all(answers), (
+            "a caller read the cache after it was marked resolved but before "
+            f"the value was stored: {answers}"
+        )
+
+    def test_path_is_walked_once_however_many_callers_arrive(self):
+        import threading
+        from claude_swap import process_detection as pd
+
+        calls = []
+
+        def counting_which(name):
+            calls.append(name)
+            time.sleep(0.02)
+            return "/usr/local/bin/claude"
+
+        self._reset()
+        try:
+            with patch.object(pd.shutil, "which", side_effect=counting_which), \
+                 patch.object(pd.os.path, "realpath", side_effect=lambda p: p):
+                threads = [threading.Thread(target=pd._native_claude_binary)
+                           for _ in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+        finally:
+            self._reset()
+
+        assert calls == ["claude"]
+
+    def test_a_missing_claude_on_path_is_cached_as_such(self):
+        from claude_swap import process_detection as pd
+
+        self._reset()
+        try:
+            with patch.object(pd.shutil, "which", return_value=None) as which:
+                assert pd._native_claude_binary() is None
+                assert pd._native_claude_binary() is None
+            assert which.call_count == 1
+        finally:
+            self._reset()
