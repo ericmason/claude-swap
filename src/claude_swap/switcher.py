@@ -330,6 +330,11 @@ class ClaudeAccountSwitcher:
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
+        # (live-credential fingerprint, resolved IDENTITY) — see
+        # _live_slot_from_identity_oracle. Per-instance: the oracle is a
+        # network call, and the CLI builds accounts_info several times a run.
+        # The identity is cached, never the slot it mapped to; slots move.
+        self._oracle_identity_cache: tuple[str, dict] | None = None
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
@@ -1934,10 +1939,21 @@ class ClaudeAccountSwitcher:
         """
         identity = self._get_current_account()
         if identity is None:
+            # Unchanged contract: no configured login is never a guessed slot.
+            # Resolving the credential store here would report a slot while
+            # has_live_login() and status both say "no login", and would let
+            # AutoSwitchEngine switch a configuration that is logged out or
+            # half-removed. The oracle corrects a STALE identity, not a
+            # missing one.
             return None
         data = self._get_sequence_data() or {}
-        email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        # Otherwise the same resolver the display and status use. Answering
+        # this from the config alone while _build_accounts_info answers it
+        # from the credential would let AutoSwitchEngine evaluate one account
+        # as current while the usage pass treats another as current —
+        # automation acting on the wrong account in exactly the drift case
+        # this resolver exists for.
+        return self._resolve_active_slot(data, identity)
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
@@ -1959,9 +1975,16 @@ class ClaudeAccountSwitcher:
         with FileLock(self.lock_file):
             self._write_account_credentials(account_num, email, credentials)
 
-    def account_identity(self, account_num: str) -> dict:
-        """Stored identity for a slot: ``{"email", "organizationUuid", "uuid"}``."""
-        data = self._get_sequence_data() or {}
+    def account_identity(self, account_num: str, data: dict | None = None) -> dict:
+        """Stored identity for a slot: ``{"email", "organizationUuid", "uuid"}``.
+
+        ``data`` pins the read to a caller's snapshot. Without it a concurrent
+        ``swap``/``move`` between the caller loading its dict and this lookup
+        can answer from the NEW layout while the caller indexes and iterates
+        the old one — labelling the slot's former occupant active and running
+        its usage path with the other account's live credential.
+        """
+        data = data if data is not None else (self._get_sequence_data() or {})
         acct = data.get("accounts", {}).get(str(account_num), {})
         return {
             "email": acct.get("email", ""),
@@ -2907,7 +2930,7 @@ class ClaudeAccountSwitcher:
         return identity is not None and identity == (email, org_uuid or "")
 
     def _resolved_matches_slot_identity(
-        self, account_num: str, resolved: dict
+        self, account_num: str, resolved: dict, data: dict | None = None
     ) -> bool | None:
         """Whether an oracle-resolved identity is this slot's account.
 
@@ -2927,7 +2950,7 @@ class ClaudeAccountSwitcher:
           is too partial to condemn or affirm). Must be treated like a
           probe failure — never cached.
         """
-        own = self.account_identity(account_num)
+        own = self.account_identity(account_num, data)
         r_uuid = (resolved.get("uuid") or "").strip()
         r_email = resolved.get("email")
         r_org = resolved.get("organizationUuid")
@@ -3951,10 +3974,7 @@ class ClaudeAccountSwitcher:
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
-        active_num = None
-        if current_identity is not None:
-            current_email, current_org_uuid = current_identity
-            active_num = self._find_account_slot(data, current_email, current_org_uuid)
+        active_num = self._resolve_active_slot(data, current_identity)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
@@ -5502,7 +5522,16 @@ class ClaudeAccountSwitcher:
                 "active": {"email": current_email, "managed": False},
             }
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num, resolved = self._active_slot_and_identity(data, identity)
+        if account_num:
+            record = data["accounts"][account_num]
+            current_email = record.get("email", current_email)
+            current_org_uuid = record.get("organizationUuid", "") or ""
+        else:
+            # See status(): an unmanaged verdict must name the credential's
+            # owner, not the stale config's managed address.
+            if resolved and resolved.get("email"):
+                current_email = resolved["email"]
         if not account_num:
             return {
                 "schemaVersion": SCHEMA_VERSION,
@@ -5559,10 +5588,24 @@ class ClaudeAccountSwitcher:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return None
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num, resolved = self._active_slot_and_identity(data, identity)
+        if account_num is None:
+            # Resolved to somebody cswap does not manage. Printing the config's
+            # email here would name a MANAGED address as unmanaged; the
+            # credential's real owner is the honest answer. Cached, so no
+            # second lookup.
+            if resolved and resolved.get("email"):
+                current_email = resolved["email"]
+                current_org_uuid = resolved.get("organizationUuid") or ""
         org_name = ""
         if account_num is not None:
-            org_name = data["accounts"][account_num].get("organizationName", "") or ""
+            record = data["accounts"][account_num]
+            org_name = record.get("organizationName", "") or ""
+            # The slot may have come from the credential rather than the
+            # config, in which case the config's email names the wrong
+            # account and would print a slot/identity mismatch.
+            current_email = record.get("email", current_email)
+            current_org_uuid = record.get("organizationUuid", "") or ""
 
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
@@ -6227,6 +6270,246 @@ class ClaudeAccountSwitcher:
             )
             return "noop-diverged", None
         return "reconcile", provenance
+
+    def _resolve_active_slot(
+        self, data: dict, identity: tuple[str, str] | None
+    ) -> str | None:
+        """The slot alone. See :meth:`_active_slot_and_identity`."""
+        return self._active_slot_and_identity(data, identity)[0]
+
+    def _active_slot_and_identity(
+        self, data: dict, identity: tuple[str, str] | None
+    ) -> tuple[str | None, dict | None]:
+        """The slot whose account is logged in — credential first, config second.
+
+        ``~/.claude.json`` is the cheap answer and usually the right one, but
+        it is a separate file from the credential with an independent writer,
+        so it can still name the previous account after a direct Claude Code
+        login. Where the two disagree the credential wins: it is what requests
+        actually authenticate with, and a slot chosen from the stale config
+        attributes the live bytes to an account they never came from. See
+        :meth:`_live_slot_from_identity_oracle` for what that costs.
+
+        One resolver for every caller that asks "which slot is active" — the
+        display, the status payload, and the usage pass previously each
+        answered it from the config alone, so a drift showed up differently in
+        each.
+
+        Returns ``(slot, resolved_identity)``. The identity travels with the
+        slot because a FAILED resolution is deliberately not cached, so a
+        caller that wanted both and asked twice would pay for a second network
+        request — up to another five-second wait on one status call.
+
+        """
+        if identity is None:
+            # No configured login is never a guessed slot — the same contract
+            # current_account_number() documents. Resolving whatever the
+            # credential store still holds would mark a slot active in list
+            # and usage collection while status and autoswitch correctly say
+            # "no login", and would process a lingering credential after a
+            # logout or a half-removed oauthAccount. The oracle corrects a
+            # STALE identity, never a missing one.
+            return None, None
+        config_num = self._find_account_slot(data, identity[0], identity[1])
+        resolved = self._resolve_live_identity(data)
+        if resolved is None:
+            # the oracle could not speak; keep the config's answer
+            return config_num, None
+        oracle_num, conclusive = self._slot_holding_identity(resolved, data)
+        if not conclusive:
+            # Resolved, but too partial to place. Same rule as an unresolved
+            # probe: keep the config's answer rather than declare the login
+            # unmanaged on evidence that cannot support it.
+            return config_num, resolved
+        if oracle_num == config_num:
+            return config_num, resolved
+        # Includes oracle_num None: the credential was positively identified
+        # and no managed slot holds it. Falling back to the config there would
+        # attribute an unmanaged login to a managed slot and then run that
+        # slot's active-usage path with somebody else's credential.
+        self._logger.info(
+            "Live credential resolves to account %s, not the %s named by "
+            "the config; treating %s as active.",
+            oracle_num or "none (unmanaged)", config_num or "none",
+            oracle_num or "no slot",
+        )
+        return oracle_num, resolved
+
+    def _resolve_live_identity(self, data: dict) -> dict | None:
+        """Slot the live credential really belongs to, or None if unresolved.
+
+        ``~/.claude.json``'s ``oauthAccount`` is the only LOCAL record of whose
+        login is active — the credential blob carries no identity — and it is
+        exactly what goes stale. Logging in with Claude Code directly is the
+        documented recovery for a slot whose refresh token died, and it moves
+        the credential without moving the config, so afterwards the config
+        names the previous account while the credential is the new one. Every
+        reader that keys off the config then attributes the live bytes to the
+        wrong slot, which surfaces two ways: a phantom "two slots hold the
+        same credential" banner (the live bytes fingerprint-match the backup
+        of the slot they actually came from), and an adoption refusal that
+        leaves cswap unable to re-point itself without a manual switch or add.
+
+        :meth:`_prefetch_live_identity` already answers this question — it
+        compares the live bytes against the config-named slot's backup and,
+        only when they diverge, asks the API whose token it is. That answer
+        was consumed solely by the switch-time backup guard; deciding which
+        slot is active is the same question, so it is reused rather than
+        re-derived.
+
+        Returns the resolved IDENTITY, not a slot — the two answers differ,
+        and callers need to tell them apart. An identity that matches no
+        managed slot is a positive finding (the login is genuinely unmanaged)
+        and must not be confused with None, which means the oracle could not
+        speak at all: offline, an expired access token, a raw API key, a
+        degraded credential read, or a response too partial to affirm. Only on
+        None does the caller keep the config's answer; the oracle is advisory,
+        and a stale label beats a guessed one.
+        """
+        try:
+            active = self._read_active_credentials()
+        except Exception as e:
+            self._logger.debug(f"Oracle live credential read failed: {e!r}")
+            return None
+        if active.degraded:
+            # A degraded read is the plaintext fallback taken when the Keychain
+            # was unreadable, and those bytes can be an older generation
+            # belonging to a DIFFERENT managed account. Resolving them would
+            # override a correct config identity and mark the wrong slot active
+            # in list, status and usage collection at once. Abstaining leaves
+            # the config's answer, which is the safer of the two here.
+            return None
+        live = active.value
+        if not live:
+            return None
+        # Keyed on the credential, not just cached once: _build_accounts_info
+        # runs several times per command, and a switch can move the live bytes
+        # underneath us mid-process. Same bytes → same owner → no second call.
+        cached = self._oracle_identity_cache
+        if cached is not None and cached[0] == oauth.credential_fingerprint(live):
+            return cached[1]
+
+        identity = self._get_current_account()
+        config_slot = (
+            self._find_account_slot(data, identity[0], identity[1])
+            if identity is not None else None
+        )
+        if config_slot is None:
+            # _prefetch_live_identity declines here: with no config-named slot
+            # it has no backup to compare against, so it never asks. But this
+            # is the case that needs asking MOST -- a stale config naming an
+            # unmanaged or since-deleted account otherwise makes a perfectly
+            # managed login report as unmanaged.
+            probed, resolved = live, self._resolve_identity_directly(live)
+        else:
+            prefetch = self._prefetch_live_identity() or {}
+            # Bind the verdict to the bytes it was resolved FROM, not to the
+            # read above. The prefetch re-reads the credential, and a switch
+            # landing between the two reads would otherwise file this identity
+            # under the previous generation's fingerprint — an answer that is
+            # wrong now and would be handed back the moment those bytes
+            # returned.
+            probed = prefetch.get("live") or live
+            resolved = prefetch.get("resolved")
+        if not resolved:
+            # Cache AFFIRMATIVE resolutions only. A miss is transient — the
+            # endpoint was unreachable, the access token had expired, the
+            # response was too partial to affirm — and a long-lived TUI that
+            # cached it would keep deferring to the stale config long after
+            # connectivity came back, since the fingerprint it is keyed on
+            # does not change until the credential itself rotates.
+            return None
+        self._oracle_identity_cache = (
+            oauth.credential_fingerprint(probed), resolved,
+        )
+        # The lookup went to the network, so the live bytes may have moved
+        # under it — a concurrent `cswap switch`. The entry cached above is
+        # still true OF `probed` and will be reused if those bytes come back,
+        # but returning it now would name the PREVIOUS credential's slot as
+        # active to status, usage collection and autoswitch alike. Abstain;
+        # the next call resolves whatever is live then.
+        if not self._live_credential_still_is(probed):
+            self._logger.debug(
+                "Live credential moved during the identity lookup; abstaining."
+            )
+            return None
+        return resolved
+
+    def _live_credential_still_is(self, probed: str) -> bool:
+        """Whether the active credential is still the bytes ``probed`` named."""
+        try:
+            active = self._read_active_credentials()
+        except Exception as e:
+            self._logger.debug(f"Post-lookup credential re-read failed: {e!r}")
+            return False
+        if active.degraded or not active.value:
+            return False
+        return (oauth.credential_fingerprint(active.value)
+                == oauth.credential_fingerprint(probed))
+
+    def _live_slot_from_identity_oracle(self, data: dict) -> str | None:
+        """The slot the live credential belongs to, or None if unresolvable.
+
+        Composition of :meth:`_resolve_live_identity` and
+        :meth:`_slot_holding_identity`. Flattens "resolved but unmanaged" into
+        None, so only use it where that distinction does not matter.
+        """
+        resolved = self._resolve_live_identity(data)
+        if resolved is None:
+            return None
+        return self._slot_holding_identity(resolved, data)[0]
+
+    def _resolve_identity_directly(self, live: str) -> dict | None:
+        """Ask the API whose credential this is, with no local shortcut.
+
+        Same call ``_prefetch_live_identity`` makes, minus its
+        compare-against-the-slot's-backup gate, which cannot run when no slot
+        is named. Advisory like every other use of the oracle: any failure is
+        None and the caller keeps the config's answer. Must not be called
+        under a credential or config lock — it does network.
+        """
+        token = oauth.extract_access_token(live)
+        if not token:
+            return None  # raw API key / garbled JSON — nothing to resolve
+        try:
+            return oauth.fetch_oauth_profile(token)
+        except Exception as e:
+            self._logger.debug(f"Direct profile resolution raised: {e!r}")
+            return None
+
+    def _slot_holding_identity(
+        self, resolved: dict, data: dict
+    ) -> tuple[str | None, bool]:
+        """Which slot currently holds ``resolved``'s account, if any.
+
+        Deliberately re-derived on every call rather than cached alongside the
+        identity. The cache key is the credential, and that does not change
+        when a slot is REMOVED or when ``swap``/``move`` reassigns which
+        account occupies a number — so a cached slot NUMBER goes wrong without
+        the credential moving at all, and callers index
+        ``data["accounts"][num]`` on this answer. The expensive part is the
+        network lookup behind ``resolved``, not this comparison, so caching
+        the identity and re-resolving the slot keeps the saving and drops the
+        staleness.
+
+        Returns ``(slot, conclusive)``. ``conclusive`` is False when any slot
+        answered "unverifiable" and none matched — a partial identity against
+        slots with no stored uuid, say. Collapsing that into a bare None would
+        read as "confirmed unmanaged" and drop the config fallback, stopping
+        auto-switch on a login that is perfectly managed.
+        """
+        unverifiable = False
+        for num in data.get("sequence", []):
+            # _resolved_matches_slot_identity is tri-state: True affirms,
+            # False condemns, None means too partial to do either.
+            verdict = self._resolved_matches_slot_identity(
+                str(num), resolved, data
+            )
+            if verdict is True:
+                return str(num), True
+            if verdict is None:
+                unverifiable = True
+        return None, not unverifiable
 
     def _prefetch_live_identity(self) -> dict:
         """Resolve the live credential's owner BEFORE the locks are taken.

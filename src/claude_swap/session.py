@@ -60,7 +60,11 @@ from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, scan_sessions
+from claude_swap.process_detection import (
+    ClaudeSession,
+    scan_env_bound_claude,
+    scan_sessions,
+)
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -464,9 +468,19 @@ def profile_is_quiescent(session_dir: Path) -> bool:
     wants. False when a record is unreadable: not knowing is not the same as
     knowing nothing is there, and the step behind these callers cannot be
     undone.
+
+    Two independent signals, because the first one is not ours. The registry is
+    written by Claude Code and a live instance can be missing from it (observed:
+    `claude --resume` mains with no record), which reads here as an idle machine
+    and lets `_bootstrap` rewrite credentials underneath a running session --
+    the mid-session logout this predicate exists to prevent.
+    :func:`scan_env_bound_claude` closes that by asking the OS which processes
+    are actually bound to this profile.
     """
     sessions, unreadable = scan_live_sessions(session_dir)
-    return not sessions and unreadable == 0
+    if sessions or unreadable:
+        return False
+    return not scan_env_bound_claude(session_dir)
 
 
 def _mkdir_private(path: Path) -> None:

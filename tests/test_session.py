@@ -136,6 +136,14 @@ def auth_status_tracks_seed(monkeypatch):
     probe_envs: list[dict] = []
 
     def fake_run(cmd, env=None, **kwargs):
+        # Only the auth-status probe is faked here. monkeypatching
+        # `subprocess.run` catches every caller in the process, so anything
+        # that isn't pointed at a profile (the CLAUDE_CONFIG_DIR liveness
+        # probe, say) gets an inert result -- a double that answered every
+        # command would hand an auth-status JSON body to a caller that asked
+        # something else entirely.
+        if not env or "CLAUDE_CONFIG_DIR" not in env:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         probe_envs.append(env)
         config_dir = Path(env["CLAUDE_CONFIG_DIR"])
         if (config_dir / ".credentials.json").exists():
