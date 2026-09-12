@@ -3535,6 +3535,109 @@ class TestActiveAccountRefresh:
         mock_fetch.assert_not_called()
 
 
+class TestActiveSlotWithASessionProfile:
+    """The active slot's recovery may not spend a running profile's grant.
+
+    A session started with `cswap run N` while N was inactive keeps running
+    when N is activated, and it rotates its own profile's token family as it
+    goes. The default store and the slot backup both stay on the generation the
+    session started from, so recovery POSTing either one earns an
+    invalid_grant, which this path reports as an authentication strike and the
+    quarantine scan turns into "re-login needed" for a healthy account.
+    """
+
+    EMAIL = "test@example.com"
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = self.EMAIL
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def _seed_profile(self, switcher, creds: str | None) -> Path:
+        session_dir = switcher._session_dir("1", self.EMAIL)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        if creds is not None:
+            (session_dir / ".credentials.json").write_text(creds)
+            (session_dir / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": self.EMAIL}
+            }))
+        return session_dir
+
+    def _fetch(self, switcher, expired: str, probe):
+        with patch.object(switcher, "_read_credentials", return_value=expired), \
+             patch("claude_swap.process_detection.scan_env_bound_claude",
+                   side_effect=lambda d: probe), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            record = switcher._fetch_active_usage("1", self.EMAIL, expired)
+        return record, post
+
+    def test_a_live_profile_keeps_the_grant_and_earns_no_strike(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        expired = _oauth_creds("sk-active", -3600)
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", self.EMAIL, expired)
+        self._seed_profile(switcher, _oauth_creds("sk-session", 7200))
+
+        record, post = self._fetch(switcher, expired, ([4242], True))
+
+        post.assert_not_called()
+        assert record.struck_fp is None
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        assert switcher.read_account_credentials("1", self.EMAIL) == expired
+
+    def test_an_unprobeable_profile_keeps_the_grant_too(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """"Could not tell" is not "idle": the instance the probe failed to see
+        rotates the family exactly as a visible one does."""
+        expired = _oauth_creds("sk-active", -3600)
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", self.EMAIL, expired)
+        self._seed_profile(switcher, _oauth_creds("sk-session", 7200))
+
+        record, post = self._fetch(switcher, expired, ([], False))
+
+        post.assert_not_called()
+        assert record.struck_fp is None
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        assert switcher.read_account_credentials("1", self.EMAIL) == expired
+
+    def test_an_idle_profile_ahead_is_adopted_before_any_recovery(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The session exited, so what it left in the profile is the current
+        generation: adopt it, and the recovery restores that credential rather
+        than POSTing the one the session already spent."""
+        expired = _oauth_creds("sk-active", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", self.EMAIL, expired)
+        self._seed_profile(switcher, profile)
+
+        record, post = self._fetch(switcher, expired, ([], True))
+
+        post.assert_not_called()
+        assert record.struck_fp is None
+        assert switcher.read_account_credentials("1", self.EMAIL) == profile
+
+    def test_a_slot_with_no_profile_recovers_as_before(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """No session profile, nothing to probe: the recovery POST runs."""
+        expired = _oauth_creds("sk-active", -3600)
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", self.EMAIL, expired)
+
+        record, post = self._fetch(switcher, expired, ([], True))
+
+        post.assert_called_once()
+
+
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
 

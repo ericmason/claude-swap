@@ -4444,6 +4444,51 @@ class ClaudeAccountSwitcher:
             )
             return FetchRecord(error="store-unmirrored")
 
+        # An ACTIVE slot can still own a session profile, and that profile can
+        # still be running: a session started with `cswap run N` while N was
+        # inactive keeps running when N is activated (the switch allows it with
+        # a warning), and it rotates its own profile's token family as it goes.
+        # The default store and the slot backup both stay on the generation the
+        # session started from, so the recovery below POSTs a grant that
+        # session has already spent: invalid_grant, which this method surfaces
+        # as an authentication strike and the quarantine scan turns into
+        # "re-login needed" for an account whose credential was never the
+        # problem. So the rule the inactive path applies in
+        # ``_fetch_account_usage`` applies here too, and for the same reason:
+        # only a profile known IDLE may have this slot's grant spent against
+        # it, and LIVE and UNKNOWN both take a route that consumes nothing.
+        session_dir = self._session_dir(account_num, email)
+        if session_dir.is_dir():
+            liveness = self._session_profile_liveness(account_num, email)
+            if liveness.state != PROFILE_IDLE:
+                self._logger.info(
+                    "Account %s is active but has %s; reporting the usage "
+                    "failure rather than consuming a grant the profile may "
+                    "already have spent.", account_num, liveness.detail,
+                )
+                return _defer(force_refresh)
+            # Idle: what the exited session left in the profile IS the current
+            # generation, and the backup holds the one it superseded. Adopt
+            # first, so that if the recovery below falls back to the backup it
+            # POSTs the live grant instead of a consumed one. Adoption
+            # re-probes under its own lock, so act on the answer it returns,
+            # never on the pre-lock one this branch was chosen with.
+            try:
+                adoption = self._adopt_session_credential(
+                    account_num, email, org_uuid, liveness=liveness
+                )
+            except LockError:
+                # A holder owns the slot; deferring costs a pass and spends
+                # nothing.
+                return _defer(force_refresh)
+            if adoption.liveness.state != PROFILE_IDLE:
+                self._logger.info(
+                    "Account %s has %s as of adoption's lock; reporting the "
+                    "usage failure rather than consuming its grant.",
+                    account_num, adoption.liveness.detail,
+                )
+                return _defer(force_refresh)
+
         # Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up
         # outright: attributable live → refresh it; unattributable live but
