@@ -331,9 +331,11 @@ class ClaudeAccountSwitcher:
         self._usage_store = UsageStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         # (live-credential fingerprint, resolved IDENTITY) — see
-        # _live_slot_from_identity_oracle. Per-instance: the oracle is a
-        # network call, and the CLI builds accounts_info several times a run.
-        # The identity is cached, never the slot it mapped to; slots move.
+        # _resolve_live_identity. Per-instance: the oracle is a network call,
+        # and the CLI builds accounts_info several times a run. The identity
+        # is cached, never the slot it mapped to; slots move. Only an identity
+        # complete enough to place a slot is cached, so a partial answer is
+        # re-asked rather than replayed.
         self._oracle_identity_cache: tuple[str, dict] | None = None
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -6288,7 +6290,7 @@ class ClaudeAccountSwitcher:
         login. Where the two disagree the credential wins: it is what requests
         actually authenticate with, and a slot chosen from the stale config
         attributes the live bytes to an account they never came from. See
-        :meth:`_live_slot_from_identity_oracle` for what that costs.
+        :meth:`_resolve_live_identity` for what that costs.
 
         One resolver for every caller that asks "which slot is active" — the
         display, the status payload, and the usage pass previously each
@@ -6336,7 +6338,7 @@ class ClaudeAccountSwitcher:
         return oracle_num, resolved
 
     def _resolve_live_identity(self, data: dict) -> dict | None:
-        """Slot the live credential really belongs to, or None if unresolved.
+        """The identity behind the live credential, or None if unresolved.
 
         ``~/.claude.json``'s ``oauthAccount`` is the only LOCAL record of whose
         login is active — the credential blob carries no identity — and it is
@@ -6419,9 +6421,22 @@ class ClaudeAccountSwitcher:
             # connectivity came back, since the fingerprint it is keyed on
             # does not change until the credential itself rotates.
             return None
-        self._oracle_identity_cache = (
-            oauth.credential_fingerprint(probed), resolved,
-        )
+        if self._slot_holding_identity(resolved, data)[1]:
+            self._oracle_identity_cache = (
+                oauth.credential_fingerprint(probed), resolved,
+            )
+        else:
+            # Resolved, but too partial to place against these slots -- a
+            # uuid-only response where the managed slots store no uuid, say.
+            # Truthy is not the same as usable, and caching it would freeze
+            # that verdict for as long as the credential lives: every later
+            # call would replay the partial answer from memory, keep deferring
+            # to the stale config, and never re-ask once a complete response
+            # became available. Hand it back unstored so the next call retries.
+            self._logger.debug(
+                "Live identity resolved but places no slot; not caching so a "
+                "later call can re-resolve it."
+            )
         # The lookup went to the network, so the live bytes may have moved
         # under it — a concurrent `cswap switch`. The entry cached above is
         # still true OF `probed` and will be reused if those bytes come back,
@@ -6446,18 +6461,6 @@ class ClaudeAccountSwitcher:
             return False
         return (oauth.credential_fingerprint(active.value)
                 == oauth.credential_fingerprint(probed))
-
-    def _live_slot_from_identity_oracle(self, data: dict) -> str | None:
-        """The slot the live credential belongs to, or None if unresolvable.
-
-        Composition of :meth:`_resolve_live_identity` and
-        :meth:`_slot_holding_identity`. Flattens "resolved but unmanaged" into
-        None, so only use it where that distinction does not matter.
-        """
-        resolved = self._resolve_live_identity(data)
-        if resolved is None:
-            return None
-        return self._slot_holding_identity(resolved, data)[0]
 
     def _resolve_identity_directly(self, live: str) -> dict | None:
         """Ask the API whose credential this is, with no local shortcut.

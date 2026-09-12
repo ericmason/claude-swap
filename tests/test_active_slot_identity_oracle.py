@@ -28,6 +28,20 @@ SEQUENCE = {
         "2": {"email": "two@example.com", "uuid": "uuid-2", "organizationUuid": "org-2"},
     },
 }
+def _live_slot(s, data):
+    """The slot the live credential belongs to, with no config fallback.
+
+    What `_active_slot_and_identity` composes in production, minus its fall
+    back to the config, so these tests can pin the oracle's own answer instead
+    of the merged one. "Resolved but held by no managed slot" flattens to None
+    here; the tests that care about that distinction read the identity itself.
+    """
+    resolved = s._resolve_live_identity(data)
+    if resolved is None:
+        return None
+    return s._slot_holding_identity(resolved, data)[0]
+
+
 def _active(value, degraded=False):
     """An ActiveCredentials-shaped double: the oracle reads .value/.degraded."""
     return SimpleNamespace(value=value, degraded=degraded)
@@ -60,7 +74,7 @@ class TestOracleResolvesTheSlot:
              patch.object(s, "_read_account_credentials", return_value=CREDS_SLOT2), \
              patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value=PROFILE_ACCOUNT_1):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) == "1"
+            assert _live_slot(s, SEQUENCE) == "1"
 
     def test_unresolvable_returns_none_so_the_config_still_wins(
         self, temp_home, mock_claude_config,
@@ -72,12 +86,12 @@ class TestOracleResolvesTheSlot:
              patch.object(s, "_read_credentials", return_value=CREDS_LIVE), \
              patch.object(s, "_read_account_credentials", return_value=CREDS_SLOT2), \
              patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
 
     def test_no_live_credential_resolves_to_none(self, temp_home, mock_claude_config):
         s = _drifted(temp_home, mock_claude_config)
         with patch.object(s, "_read_active_credentials", return_value=_active("")):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
 
     def test_matching_backup_needs_no_network_at_all(
         self, temp_home, mock_claude_config,
@@ -89,7 +103,7 @@ class TestOracleResolvesTheSlot:
              patch.object(s, "_read_credentials", return_value=CREDS_LIVE), \
              patch.object(s, "_read_account_credentials", return_value=CREDS_LIVE), \
              patch("claude_swap.oauth.fetch_oauth_profile") as fetch:
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
         fetch.assert_not_called()
 
     def test_result_is_cached_per_credential(self, temp_home, mock_claude_config):
@@ -102,7 +116,7 @@ class TestOracleResolvesTheSlot:
              patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value=PROFILE_ACCOUNT_1) as fetch:
             for _ in range(3):
-                assert s._live_slot_from_identity_oracle(SEQUENCE) == "1"
+                assert _live_slot(s, SEQUENCE) == "1"
         assert fetch.call_count == 1
 
     def test_a_partial_identity_does_not_affirm_a_slot(
@@ -117,7 +131,7 @@ class TestOracleResolvesTheSlot:
              patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value={"uuid": "uuid-nobody"}), \
              patch.object(s, "_resolved_matches_slot_identity", return_value=None):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
 
 
 class TestBuildAccountsInfoPrefersTheOracle:
@@ -217,7 +231,7 @@ class TestEveryCallerAgreesOnTheActiveSlot:
                    return_value={"uuid": "uuid-stranger",
                                  "email": "nobody@example.com",
                                  "organizationUuid": "org-x"}):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
 
 
 class TestCachedVerdictsCannotGoStale:
@@ -236,11 +250,11 @@ class TestCachedVerdictsCannotGoStale:
              patch.object(s, "_read_account_credentials", return_value=CREDS_SLOT2), \
              patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value=PROFILE_ACCOUNT_1):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) == "1"
+            assert _live_slot(s, SEQUENCE) == "1"
 
             without_1 = {"activeAccountNumber": 2, "sequence": [2],
                          "accounts": {"2": SEQUENCE["accounts"]["2"]}}
-            assert s._live_slot_from_identity_oracle(without_1) is None
+            assert _live_slot(s, without_1) is None
 
     def test_status_survives_a_slot_removed_under_a_cached_verdict(
         self, temp_home, mock_claude_config,
@@ -252,7 +266,7 @@ class TestCachedVerdictsCannotGoStale:
              patch.object(s, "_read_account_credentials", return_value=CREDS_SLOT2), \
              patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value=PROFILE_ACCOUNT_1):
-            s._live_slot_from_identity_oracle(SEQUENCE)          # warms the cache
+            _live_slot(s, SEQUENCE)          # warms the cache
             without_1 = {"activeAccountNumber": 2, "sequence": [2],
                          "accounts": {"2": SEQUENCE["accounts"]["2"]}}
             s._write_json(s.sequence_file, without_1)
@@ -276,12 +290,69 @@ class TestCachedVerdictsCannotGoStale:
                                         "resolved": PROFILE_ACCOUNT_1}):
             # probed != the live bytes, so this IS the moved-mid-lookup case:
             # abstain now, but still file the verdict under what it describes.
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
         cached_fp, cached_identity = s._oracle_identity_cache
         assert cached_identity == PROFILE_ACCOUNT_1
         assert cached_fp == oauth_mod.credential_fingerprint(moved), \
             "filed under the bytes the identity actually describes"
         assert cached_fp != oauth_mod.credential_fingerprint(CREDS_LIVE)
+
+
+PROFILE_UUID_ONLY = {"uuid": "uuid-1", "email": None, "organizationUuid": None}
+
+# Slots that predate uuid tracking: an `add-token` record stores the email and
+# org but no uuid, so a uuid-only identity can neither affirm nor condemn one.
+NO_UUIDS = {
+    "activeAccountNumber": 2,
+    "sequence": [1, 2],
+    "accounts": {
+        "1": {"email": "one@example.com", "organizationUuid": "org-1"},
+        "2": {"email": "two@example.com", "organizationUuid": "org-2"},
+    },
+}
+
+
+class TestAnIdentityTooPartialToPlaceIsNotCached:
+    """Truthy is not the same as usable."""
+
+    def test_an_identity_that_places_no_slot_is_re_asked(
+        self, temp_home, mock_claude_config,
+    ):
+        """A uuid-only response cannot place slots that store no uuid, so the
+        caller keeps the stale config. Caching it froze that verdict for the
+        life of the credential: every later call replayed the partial answer
+        and never saw the complete one, leaving the wrong slot marked active
+        in status, list and usage alike."""
+        s = _drifted(temp_home, mock_claude_config)
+        s._write_json(s.sequence_file, NO_UUIDS)
+        with patch.object(s, "_read_active_credentials",
+                          return_value=_active(CREDS_LIVE)), \
+             patch.object(s, "_read_credentials", return_value=CREDS_LIVE), \
+             patch.object(
+                 s, "_prefetch_live_identity",
+                 side_effect=[{"live": CREDS_LIVE, "resolved": PROFILE_UUID_ONLY},
+                              {"live": CREDS_LIVE, "resolved": PROFILE_ACCOUNT_1}],
+             ) as prefetch:
+            assert _live_slot(s, NO_UUIDS) is None
+            assert s._oracle_identity_cache is None, "nothing usable to remember"
+            assert _live_slot(s, NO_UUIDS) == "1"
+            assert prefetch.call_count == 2
+
+    def test_a_placeable_identity_is_still_cached(
+        self, temp_home, mock_claude_config,
+    ):
+        """The gate must not cost the saving it was added around: one network
+        call per credential, however many times accounts_info is built."""
+        s = _drifted(temp_home, mock_claude_config)
+        with patch.object(s, "_read_active_credentials",
+                          return_value=_active(CREDS_LIVE)), \
+             patch.object(s, "_read_credentials", return_value=CREDS_LIVE), \
+             patch.object(s, "_read_account_credentials", return_value=CREDS_SLOT2), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=PROFILE_ACCOUNT_1) as fetch:
+            assert _live_slot(s, SEQUENCE) == "1"
+            assert _live_slot(s, SEQUENCE) == "1"
+        assert fetch.call_count == 1
 
 
 class TestTheCacheHoldsIdentityNotSlot:
@@ -303,7 +374,7 @@ class TestTheCacheHoldsIdentityNotSlot:
         s = _drifted(temp_home, mock_claude_config)
         a, b, c, d = self._warm(s)
         with a, b, c, d:
-            assert s._live_slot_from_identity_oracle(SEQUENCE) == "1"
+            assert _live_slot(s, SEQUENCE) == "1"
             swapped = {
                 "activeAccountNumber": 2, "sequence": [1, 2],
                 "accounts": {
@@ -314,7 +385,7 @@ class TestTheCacheHoldsIdentityNotSlot:
             # account_identity() reads the sequence FILE, so the swap has to
             # land there and not just in the dict passed to the oracle.
             s._write_json(s.sequence_file, swapped)
-            assert s._live_slot_from_identity_oracle(swapped) == "2"
+            assert _live_slot(s, swapped) == "2"
 
     def test_an_unresolved_lookup_is_retried_not_remembered(
         self, temp_home, mock_claude_config,
@@ -328,8 +399,8 @@ class TestTheCacheHoldsIdentityNotSlot:
              patch.object(s, "_read_account_credentials", return_value=CREDS_SLOT2), \
              patch("claude_swap.oauth.fetch_oauth_profile",
                    side_effect=[None, PROFILE_ACCOUNT_1]) as fetch:
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
-            assert s._live_slot_from_identity_oracle(SEQUENCE) == "1"
+            assert _live_slot(s, SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) == "1"
         assert fetch.call_count == 2, "the miss must not have been cached"
 
 
@@ -342,7 +413,7 @@ class TestTheOracleKnowsWhenNotToSpeak:
         with patch.object(s, "_read_active_credentials",
                           return_value=_active(CREDS_LIVE, degraded=True)), \
              patch("claude_swap.oauth.fetch_oauth_profile") as fetch:
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
         fetch.assert_not_called()
 
 
@@ -364,7 +435,7 @@ class TestConfigNamingNoManagedSlot:
              patch.object(s, "_read_credentials", return_value=CREDS_LIVE), \
              patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value=PROFILE_ACCOUNT_1):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) == "1"
+            assert _live_slot(s, SEQUENCE) == "1"
 
     def test_it_still_abstains_when_the_direct_lookup_fails(
         self, temp_home, mock_claude_config,
@@ -375,7 +446,7 @@ class TestConfigNamingNoManagedSlot:
                           return_value=_active(CREDS_LIVE)), \
              patch.object(s, "_read_credentials", return_value=CREDS_LIVE), \
              patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
-            assert s._live_slot_from_identity_oracle(SEQUENCE) is None
+            assert _live_slot(s, SEQUENCE) is None
 
 
 PROFILE_STRANGER = {"uuid": "uuid-stranger", "email": "nobody@example.com",

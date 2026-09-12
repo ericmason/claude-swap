@@ -476,11 +476,17 @@ def profile_is_quiescent(session_dir: Path) -> bool:
     the mid-session logout this predicate exists to prevent.
     :func:`scan_env_bound_claude` closes that by asking the OS which processes
     are actually bound to this profile.
+
+    Both signals fail closed, for the same reason the unreadable count does. A
+    probe that could not run leaves this profile's liveness unknown, and
+    rewriting credentials on an unknown is the mid-session logout again,
+    reached by a different route.
     """
     sessions, unreadable = scan_live_sessions(session_dir)
     if sessions or unreadable:
         return False
-    return not scan_env_bound_claude(session_dir)
+    bound, probed = scan_env_bound_claude(session_dir)
+    return probed and not bound
 
 
 def _mkdir_private(path: Path) -> None:

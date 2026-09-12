@@ -196,6 +196,14 @@ _ARGV_PROBE_ARGV = ("ps", "-Awwo", "pid=,command=")
 # argv, and the binary tested below is its first token either way.
 _ENV_PAIR = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_]*=")
 
+# The same assignment shape, but capturing the NAME and allowed to match at the
+# very start of the string, so the environment can be parsed into pairs rather
+# than substring-searched. Substring matching got both ends of a variable
+# wrong: with no boundary before the name, `OTHER_CLAUDE_CONFIG_DIR=/p` satisfied
+# a search for `CLAUDE_CONFIG_DIR=/p`, and with the value ended at whitespace,
+# a profile at `/p` matched a process whose profile was `/p old`.
+_ENV_ASSIGN = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=")
+
 # Runtimes a non-native install can front the CLI with. Only these get their
 # script argument inspected; for anything else argv[0] is the whole test.
 _SCRIPT_INTERPRETERS = frozenset({"node", "bun", "deno", "python", "python3"})
@@ -220,8 +228,14 @@ _CLAUDE_PACKAGE = re.compile(r"/claude-code/")
 # live main. `--opt=value` forms need no entry here; they are self-contained.
 _VALUE_FLAGS = frozenset({
     "-r", "--require", "--import", "--loader", "--experimental-loader",
-    "--env-file", "-C", "--conditions", "-e", "--eval", "-p", "--print",
+    "--env-file", "-C", "--conditions",
 })
+
+# Options whose value IS the program. There is no script argument after one of
+# these, so every remaining token is argv for the inline code: `node --eval
+# 'setInterval(...)' /opt/bin/claude` holds a path, it does not run claude.
+# Kept apart from _VALUE_FLAGS, which merely consume a token and carry on.
+_EVAL_FLAGS = frozenset({"-e", "--eval", "-p", "--print"})
 
 
 def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str]:
@@ -263,6 +277,26 @@ def _executables_by_pid() -> dict[int, str]:
 def _argv_by_pid() -> dict[int, str]:
     """pid -> argv, with no environment appended. Empty when unavailable."""
     return _pid_map(_ARGV_PROBE_ARGV, "argv probe")
+
+
+def _env_pairs(env: str) -> dict[str, str]:
+    """Parse a flattened `ps` environment into ``{name: value}``.
+
+    Each value runs to the start of the next assignment rather than to the
+    next space, so a value containing spaces survives and cannot be confused
+    with a shorter one that is a prefix of it.
+
+    A value that itself contains an assignment-shaped word (``NOTE=a B=c``)
+    still splits at that word — flattened output carries no quoting, so the
+    ambiguity is in the data, not the parse. It costs a spurious extra name,
+    never a wrong value for the name this module reads.
+    """
+    marks = list(_ENV_ASSIGN.finditer(env))
+    pairs: dict[str, str] = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(env)
+        pairs[m.group(1)] = env[m.end():end]
+    return pairs
 
 
 def _is_claude_executable(executable: str | None) -> bool:
@@ -313,26 +347,17 @@ def _is_claude_argv(argv: str) -> bool:
     # or `tail -f .../claude` as a live main and hold the profile
     # un-quiescent for as long as that editor stayed open — and those are
     # exactly the commands run from inside a claude session, which inherit
-    # CLAUDE_CONFIG_DIR and so reach this test in the first place.
+    # CLAUDE_CONFIG_DIR and so reach this test in the first place. The same
+    # reasoning bars matching the npm package directory anywhere in argv:
+    # `node worker.js .../@anthropic-ai/claude-code/cli.js` is a worker that
+    # was handed the entrypoint's path, not the entrypoint running.
     if os.path.basename(tokens[0]) not in _SCRIPT_INTERPRETERS:
         return False
     rest = argv.split(None, 1)[1] if len(tokens) > 1 else ""
-    # The package directory identifies the npm distribution wherever it sits in
-    # argv, so it is checked before the script position is worked out at all —
-    # that signal is unambiguous, and locating the script exactly is not always
-    # possible (an option taking a value, a path with spaces).
-    if _CLAUDE_PACKAGE.search(rest):
-        return True
-    while rest.startswith("-"):  # interpreter flags precede the script path
-        parts = rest.split(None, 1)
-        flag, remainder = parts[0], (parts[1] if len(parts) > 1 else "")
-        if flag in _VALUE_FLAGS:  # drop the option AND the value it consumes
-            after = remainder.split(None, 1)
-            remainder = after[1] if len(after) > 1 else ""
-        rest = remainder
-    if not rest:
+    script = _interpreter_script(rest)
+    if script is None:
         return False
-    first = rest.split(None, 1)[0]
+    first = script.split(None, 1)[0]
     if os.path.basename(first) == "claude":
         return True
     if _CLAUDE_PACKAGE.search(first):
@@ -349,29 +374,68 @@ def _is_claude_argv(argv: str) -> bool:
     # "/Users/me/Application Support/claude"`), where splitting yields
     # `/Users/me/Application` and rejects a live main. Only the path's tail is
     # needed to recognise it, and the tail has no space in it.
-    return _SCRIPT_TAIL.search(rest) is not None
+    return _SCRIPT_TAIL.search(script) is not None
 
 
-def scan_env_bound_claude(session_dir: Path) -> list[int]:
-    """Live `claude` PIDs bound to ``session_dir`` by CLAUDE_CONFIG_DIR.
+def _interpreter_script(rest: str) -> str | None:
+    """Everything from the script argument on, or None when there is no script.
 
-    Best effort, and deliberately so. This is a SUPPLEMENT to the session
-    registry, not a replacement: it may only ever ADD liveness the registry
-    missed. So every way it can fail to speak — Windows, no `ps`, a `ps` that
-    errors or times out — yields an empty list, leaving the caller exactly as
-    well-informed as it was before this signal existed.
+    ``rest`` is argv after the interpreter. Interpreter options precede the
+    script path, and two kinds have to be told apart:
 
-    Failing closed instead would be the wrong trade twice over. It would make
-    a profile un-re-seedable for as long as the probe stayed broken, on
-    platforms where it can never work at all; and it would be a stricter
-    verdict than the evidence supports, since "I could not look" is not
-    "someone is there". Contrast :func:`scan_sessions`, which does report its
-    unreadable count: that signal is authoritative, so not being able to read
-    it is itself a fact about the profile. A failure here is logged, never
-    silent.
+    * an option that CONSUMES the next token (``--require setup.js``) — drop
+      both, or the value is mistaken for the script and a live main is missed;
+    * an option that REPLACES the script with inline code (``--eval``,
+      ``--print``) — there is no script at all, so every token after the code
+      is argv for that inline program. ``node --eval '…' /opt/bin/claude`` is
+      a one-liner that was handed a path, and reading it as a main pins the
+      profile non-quiescent for as long as it runs.
+
+    The value is returned rather than the bare first token because a script
+    path may contain spaces; the caller needs the tail to recognise it.
     """
-    if sys.platform == "win32" or shutil.which("ps") is None:
-        return []
+    while rest.startswith("-"):
+        parts = rest.split(None, 1)
+        flag, remainder = parts[0], (parts[1] if len(parts) > 1 else "")
+        base = flag.split("=", 1)[0]
+        if base in _EVAL_FLAGS:
+            # Inline code replaces the script. `--eval=CODE` carries its own
+            # value; the separate form consumes the next token. Either way
+            # nothing after this point is a script path.
+            return None
+        if "=" not in flag and base in _VALUE_FLAGS:
+            after = remainder.split(None, 1)
+            remainder = after[1] if len(after) > 1 else ""
+        rest = remainder
+    return rest or None
+
+
+def scan_env_bound_claude(session_dir: Path) -> tuple[list[int], bool]:
+    """Live `claude` PIDs bound to ``session_dir``, and whether the probe ran.
+
+    Returns ``(pids, probed)``. ``probed`` is False when the OS could not be
+    asked at all: `ps` is absent, raised, timed out, or exited nonzero. The
+    caller must treat that as "unknown", not as "nobody is there" — the step
+    behind :func:`profile_is_quiescent` rewrites credentials, and doing that
+    under a session this probe simply failed to see is the mid-session logout
+    the probe was added to prevent. An empty list with ``probed`` True is the
+    only answer that means the profile is idle.
+
+    The pid list is still a SUPPLEMENT to the session registry and may only
+    ever ADD liveness it missed; the flag is what stops a broken probe from
+    silently subtracting the signal instead.
+
+    Windows is the one exception, reported as ``(…, True)``: there is no cheap
+    environment read there, so the probe is not broken but absent. Failing
+    closed on it would leave every Windows profile permanently un-re-seedable,
+    which is a worse bargain than the registry alone.
+    """
+    if sys.platform == "win32":
+        return [], True
+    if shutil.which("ps") is None:
+        logger.warning("CLAUDE_CONFIG_DIR probe unavailable (no `ps`); "
+                       "profile liveness is unknown")
+        return [], False
 
     try:
         proc = subprocess.run(
@@ -380,21 +444,18 @@ def scan_env_bound_claude(session_dir: Path) -> list[int]:
         )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         # See _executables_by_pid: ValueError is here for UnicodeDecodeError,
-        # which neither of the other two clauses covers. Raising out of a
-        # best-effort probe would break `cswap run` outright.
-        logger.warning("CLAUDE_CONFIG_DIR probe failed (%s); falling back to "
-                       "the session registry alone", exc)
-        return []
+        # which neither of the other two clauses covers. Raising out of the
+        # probe would break `cswap run` outright, so the failure is reported
+        # rather than raised.
+        logger.warning("CLAUDE_CONFIG_DIR probe failed (%s); profile liveness "
+                       "is unknown", exc)
+        return [], False
     if proc.returncode != 0:
-        logger.warning("CLAUDE_CONFIG_DIR probe exited %s; falling back to "
-                       "the session registry alone", proc.returncode)
-        return []
+        logger.warning("CLAUDE_CONFIG_DIR probe exited %s; profile liveness "
+                       "is unknown", proc.returncode)
+        return [], False
 
-    # Anchored on the right so `.../sessions/1-eric` cannot match a longer
-    # sibling like `.../sessions/1-eric-old`.
-    bound = re.compile(
-        r"CLAUDE_CONFIG_DIR=" + re.escape(str(session_dir)) + r"(?=\s|$)"
-    )
+    target = str(session_dir)
     executables = _executables_by_pid()
     argvs = _argv_by_pid()
     pids: list[int] = []
@@ -407,7 +468,10 @@ def scan_env_bound_claude(session_dir: Path) -> list[int]:
         argv, env = _split_argv_env(rest, argvs.get(pid_candidate))
         if env is None:
             continue  # no environment visible (another user's process)
-        if not bound.search(env):
+        # Exact name, exact value. A sibling profile `<dir>-old` differs in the
+        # value and a variable merely ENDING in the name differs in the key,
+        # so neither can bind this directory.
+        if _env_pairs(env).get("CLAUDE_CONFIG_DIR") != target:
             continue
         pid = pid_candidate
         # Executable first: it is space-safe. argv is the fallback that still
@@ -417,7 +481,7 @@ def scan_env_bound_claude(session_dir: Path) -> list[int]:
                 or _is_claude_argv(argv)):
             continue
         pids.append(pid)
-    return pids
+    return pids, True
 
 
 def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:

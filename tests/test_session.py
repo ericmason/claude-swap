@@ -532,7 +532,16 @@ class TestBootstrap:
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / session_mod.STALE_MARKER).touch()
 
-        def raise_timeout(*a, **k):
+        real_run = session_mod.subprocess.run
+
+        def raise_timeout(argv, *a, **k):
+            # Time out the auth probe ONLY. `session_mod.subprocess` is the
+            # stdlib module, so a blanket patch also kills the quiescence
+            # probe in process_detection, which fails closed on a `ps` it
+            # could not run — making these tests assert the opposite of what
+            # their names say.
+            if argv and argv[0] == "ps":
+                return real_run(argv, *a, **k)
             raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
 
         monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
@@ -639,7 +648,16 @@ class TestIsSessionValid:
         )
 
     def _probe_times_out(self, monkeypatch):
-        def raise_timeout(*a, **k):
+        real_run = session_mod.subprocess.run
+
+        def raise_timeout(argv, *a, **k):
+            # Time out the auth probe ONLY. `session_mod.subprocess` is the
+            # stdlib module, so a blanket patch also kills the quiescence
+            # probe in process_detection, which fails closed on a `ps` it
+            # could not run — making these tests assert the opposite of what
+            # their names say.
+            if argv and argv[0] == "ps":
+                return real_run(argv, *a, **k)
             raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
 
         monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)

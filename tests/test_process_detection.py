@@ -457,6 +457,30 @@ class TestIsClaudeArgv:
         assert _is_claude_argv(argv) is False
 
     @pytest.mark.parametrize("argv", [
+        "node --eval setInterval(()=>{},1e3) /opt/bin/claude",
+        "node -e require('./x') /opt/nm/@anthropic-ai/claude-code/cli.js",
+        "node --eval=setInterval(()=>{},1e3) /opt/bin/claude",
+        "node --print process.version /opt/bin/claude",
+    ])
+    def test_inline_code_replaces_the_script_so_nothing_after_it_is_one(self, argv):
+        """`--eval` and `--print` ARE the program, so every later token is argv
+        for that one-liner. A daemon handed claude's path is not claude, and
+        reading it as one pins the profile non-quiescent while it runs."""
+        assert _is_claude_argv(argv) is False
+
+    def test_inline_code_does_not_hide_a_script_that_comes_after_a_value_flag(self):
+        """The two option shapes must stay apart: --require consumes a token
+        and carries on, --eval ends the search."""
+        assert _is_claude_argv(
+            "node --require setup.js --enable-source-maps /opt/bin/claude") is True
+
+    def test_the_package_directory_only_counts_at_the_entrypoint(self):
+        """Matching `/claude-code/` anywhere in argv read a worker that was
+        handed the entrypoint's path as the entrypoint itself."""
+        assert _is_claude_argv(
+            "node /srv/worker.js /opt/nm/@anthropic-ai/claude-code/cli.js") is False
+
+    @pytest.mark.parametrize("argv", [
         "vim /usr/local/bin/claude",
         "tail -f /Users/e/.local/bin/claude",
         "cp /usr/local/bin/claude /tmp/claude",
@@ -490,45 +514,53 @@ class TestScanEnvBoundClaude:
         d = tmp_path / "1-acct"
         out = f"  4242 /usr/local/bin/claude --resume x CLAUDE_CONFIG_DIR={d} TERM=xterm\n"
         with self._ps(out):
-            assert scan_env_bound_claude(d) == [4242]
+            assert scan_env_bound_claude(d) == ([4242], True)
 
     def test_ignores_a_process_that_only_inherited_the_var(self, tmp_path):
         d = tmp_path / "1-acct"
         out = f"  99 /bin/zsh -c ls CLAUDE_CONFIG_DIR={d}\n"
         with self._ps(out):
-            assert scan_env_bound_claude(d) == []
+            assert scan_env_bound_claude(d) == ([], True)
 
     def test_a_longer_sibling_dir_does_not_match(self, tmp_path):
         """`.../1-eric` must not match `.../1-eric-old` — the match is right-anchored."""
         d = tmp_path / "1-eric"
         out = f"  7 /usr/bin/claude CLAUDE_CONFIG_DIR={d}-old\n"
         with self._ps(out):
-            assert scan_env_bound_claude(d) == []
+            assert scan_env_bound_claude(d) == ([], True)
 
     def test_a_process_with_no_visible_env_is_skipped(self, tmp_path):
         d = tmp_path / "1-acct"
         with self._ps("  5 /usr/bin/claude\n"):
-            assert scan_env_bound_claude(d) == []
+            assert scan_env_bound_claude(d) == ([], True)
 
-    def test_a_broken_probe_adds_no_evidence_rather_than_failing_closed(
+    def test_a_broken_probe_reports_that_it_could_not_look(
         self, tmp_path, caplog,
     ):
-        """The probe only ever ADDS liveness; unable to look must not read as
-        'someone is there', or a broken `ps` wedges the profile forever."""
+        """An empty list alone reads as "nobody is there", and the caller
+        rewrites credentials on it. A probe that raised saw nothing, so it
+        must say so and let the caller fail closed."""
         with patch("claude_swap.process_detection.subprocess.run",
                    side_effect=OSError("boom")):
-            assert scan_env_bound_claude(tmp_path) == []
+            assert scan_env_bound_claude(tmp_path) == ([], False)
         assert "probe failed" in caplog.text, "a silent fallback would hide it"
 
-    def test_nonzero_exit_also_adds_no_evidence(self, tmp_path):
+    def test_a_nonzero_exit_is_also_a_failure_to_look(self, tmp_path, caplog):
         with self._ps("", returncode=1):
-            assert scan_env_bound_claude(tmp_path) == []
+            assert scan_env_bound_claude(tmp_path) == ([], False)
+        assert "exited 1" in caplog.text
 
-    def test_absent_ps_still_lets_the_profile_reseed(self, tmp_path):
-        """There is no cheap environment read on Windows; failing closed there
-        would mean a profile that can never be re-seeded."""
+    def test_absent_ps_is_a_failure_to_look_too(self, tmp_path, caplog):
         with patch("claude_swap.process_detection.shutil.which", return_value=None):
-            assert scan_env_bound_claude(tmp_path) == []
+            assert scan_env_bound_claude(tmp_path) == ([], False)
+        assert "no `ps`" in caplog.text, "a silent fallback would hide it"
+
+    def test_windows_is_the_one_platform_that_still_fails_open(self, tmp_path):
+        """There is no cheap environment read on Windows, so the probe is
+        absent rather than broken. Failing closed there would leave every
+        Windows profile permanently un-re-seedable."""
+        with patch("claude_swap.process_detection.sys.platform", "win32"):
+            assert scan_env_bound_claude(tmp_path) == ([], True)
 
 
 class TestProfileIsQuiescentUsesBothSignals:
@@ -550,6 +582,17 @@ class TestProfileIsQuiescentUsesBothSignals:
                    return_value=SimpleNamespace(stdout="", returncode=0)):
             assert profile_is_quiescent(d) is True
 
+    def test_a_probe_that_could_not_run_is_not_quiescence(self, tmp_path):
+        """The registry is exactly what misses an unregistered `claude
+        --resume`, so a dead probe leaves liveness unknown. Calling that idle
+        rewrites credentials under a live session: the bug this module
+        exists to stop, reached by a different route."""
+        d = tmp_path / "profile"
+        (d / "sessions").mkdir(parents=True)          # registry: empty
+        with patch("claude_swap.process_detection.subprocess.run",
+                   side_effect=OSError("boom")):
+            assert profile_is_quiescent(d) is False
+
 
 class TestUndecodableProcessTable:
     """`ps` output is other processes' bytes; none of it is ours to trust."""
@@ -563,7 +606,7 @@ class TestUndecodableProcessTable:
         with patch("claude_swap.process_detection.subprocess.run",
                    side_effect=lambda argv, **k: SimpleNamespace(
                        stdout=out if "ewwx" in argv else "", returncode=0)) as run:
-            assert scan_env_bound_claude(d) == [7]
+            assert scan_env_bound_claude(d) == ([7], True)
         assert all(c.kwargs.get("errors") == "replace" for c in run.call_args_list)
 
     def test_a_decode_error_is_answered_not_raised(self, tmp_path):
@@ -572,7 +615,7 @@ class TestUndecodableProcessTable:
         boom = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
         with patch("claude_swap.process_detection.subprocess.run",
                    side_effect=boom):
-            assert scan_env_bound_claude(tmp_path) == []
+            assert scan_env_bound_claude(tmp_path) == ([], False)
 
 
 class TestEnvIsTakenNotGuessed:
@@ -597,13 +640,13 @@ class TestEnvIsTakenNotGuessed:
         d = tmp_path / "1-acct"
         argv = f'/usr/bin/claude -p set CLAUDE_CONFIG_DIR={d}'
         with self._probes(f"  8 {argv} PATH=/usr/bin\n", f"  8 {argv}\n"):
-            assert scan_env_bound_claude(d) == []
+            assert scan_env_bound_claude(d) == ([], True)
 
     def test_the_real_binding_is_still_found_beside_such_an_argument(self, tmp_path):
         d = tmp_path / "1-acct"
         argv = f'/usr/bin/claude -p set CLAUDE_CONFIG_DIR={d}'
         with self._probes(f"  8 {argv} CLAUDE_CONFIG_DIR={d}\n", f"  8 {argv}\n"):
-            assert scan_env_bound_claude(d) == [8]
+            assert scan_env_bound_claude(d) == ([8], True)
 
     def test_an_env_value_with_spaces_does_not_swallow_the_binding(self, tmp_path):
         """Guessing the boundary from the first assignment also fails the other
@@ -612,7 +655,44 @@ class TestEnvIsTakenNotGuessed:
         argv = "/usr/bin/claude"
         env = f"LS_COLORS=a b c CLAUDE_CONFIG_DIR={d}"
         with self._probes(f"  9 {argv} {env}\n", f"  9 {argv}\n"):
-            assert scan_env_bound_claude(d) == [9]
+            assert scan_env_bound_claude(d) == ([9], True)
+
+
+class TestTheEnvironmentIsParsedNotSubstringSearched:
+    """Both ends of a variable have to be pinned, or a neighbour reads as a hit."""
+
+    def _probes(self, env, argv_line):
+        def fake(argv, **kwargs):
+            if "ewwx" in argv:
+                out = f"  11 {argv_line} {env}\n"
+            elif argv[-1].endswith("comm="):
+                out = ""
+            else:
+                out = f"  11 {argv_line}\n"
+            return SimpleNamespace(stdout=out, returncode=0)
+        return patch("claude_swap.process_detection.subprocess.run",
+                     side_effect=fake)
+
+    def test_a_variable_whose_name_merely_ends_in_the_key_is_not_it(self, tmp_path):
+        """With no boundary before the name, `OTHER_CLAUDE_CONFIG_DIR=<profile>`
+        satisfied a search for `CLAUDE_CONFIG_DIR=<profile>`, so a process
+        bound to somebody else's profile held this one non-quiescent."""
+        d = tmp_path / "1-acct"
+        env = f"OTHER_CLAUDE_CONFIG_DIR={d} CLAUDE_CONFIG_DIR=/other"
+        with self._probes(env, "/usr/bin/claude"):
+            assert scan_env_bound_claude(d) == ([], True)
+
+    def test_the_value_runs_to_the_next_variable_not_the_next_space(self, tmp_path):
+        """A profile path with a space in it is a different path. Ending the
+        value at whitespace made `<profile> old` match `<profile>`."""
+        d = tmp_path / "1-acct"
+        with self._probes(f"CLAUDE_CONFIG_DIR={d} old", "/usr/bin/claude"):
+            assert scan_env_bound_claude(d) == ([], True)
+
+    def test_that_same_spacey_profile_still_matches_itself(self, tmp_path):
+        d = tmp_path / "1 acct"
+        with self._probes(f"CLAUDE_CONFIG_DIR={d} TERM=xterm", "/usr/bin/claude"):
+            assert scan_env_bound_claude(d) == ([11], True)
 
 
 class TestProbesMustNotBeTruncated:
