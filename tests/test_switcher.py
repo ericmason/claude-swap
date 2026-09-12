@@ -3711,7 +3711,55 @@ class TestActiveSlotWithASessionProfile:
         assert records["1"].sentinel == USAGE_TOKEN_EXPIRED
         post.assert_not_called()
 
+    def test_a_generation_rotated_during_the_lock_wait_is_the_one_posted(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Liveness is only half of what the gate asked.
 
+        The gate found nothing to adopt because the profile held the same
+        generation as the backup. A profile-bound claude then started, rotated
+        the family, and exited while the recovery waited for its locks, so the
+        profile now holds the successor and the backup's grant is spent.
+        POSTing the backup earns invalid_grant, and the failure demotion
+        re-reads only the two copies that did not move, so it strikes a slot
+        whose credential was never the problem.
+        """
+        from contextlib import contextmanager
+
+        from claude_swap.claude_locks import (
+            claude_credentials_lock as real_cc_lock,
+        )
+
+        spent = _oauth_creds("sk-a", -3600)
+        rotated = _oauth_creds("sk-b", -60)
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", self.EMAIL, spent)
+        session_dir = self._seed_profile(switcher, spent)
+
+        @contextmanager
+        def rotate_during_the_lock_wait(*args, **kwargs):
+            (session_dir / ".credentials.json").write_text(rotated)
+            with real_cc_lock(*args, **kwargs):
+                yield
+
+        with patch.object(switcher, "_read_credentials", return_value=spent), \
+             patch("claude_swap.process_detection.scan_env_bound_claude",
+                   side_effect=lambda d: ([], True)), \
+             patch("claude_swap.switcher.claude_credentials_lock",
+                   rotate_during_the_lock_wait), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(
+                       _oauth_creds("sk-c", 7200), None)) as post, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            record = switcher._fetch_active_usage("1", self.EMAIL, spent)
+
+        post.assert_called_once()
+        assert post.call_args.args[0] == rotated, (
+            "the recovery POSTed a generation the profile had already spent"
+        )
+        assert record.struck_fp is None
+        assert record.usage == {"five_hour": {"pct": 5}}
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
 

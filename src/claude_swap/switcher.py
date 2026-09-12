@@ -3041,6 +3041,12 @@ class ClaudeAccountSwitcher:
             return None
         issued = oauth.extract_oauth_data(profile) or {}
         stored = oauth.extract_oauth_data(backup) or {}
+        if not (issued.get("accessToken") and issued.get("refreshToken")):
+            # A half-written or token-wiped profile is not a newer generation
+            # of anything, and every caller ADOPTS what this returns: writing
+            # it would replace the backup's only refresh token with nothing.
+            # Same guard the consume gate applies before it resyncs.
+            return None
         try:
             newer = float(issued.get("expiresAt") or 0) > float(
                 stored.get("expiresAt") or 0
@@ -4609,6 +4615,47 @@ class ClaudeAccountSwitcher:
                             account_num, relive.detail,
                         )
                         return _defer(force_refresh)
+                    # Liveness is only half of what the gate answered. The
+                    # gate adopted whatever the profile held THEN; a session
+                    # that started and exited during the lock wait leaves a
+                    # newer generation in the profile, and the selection below
+                    # would POST the generation that session already spent.
+                    # The failure demotion re-reads only the default store and
+                    # the backup, neither of which moved, so it reads "not
+                    # moved" and a healthy slot takes the strike. Same
+                    # precedence rule adoption and the consume gate apply, run
+                    # inline because this thread already holds
+                    # ``self.lock_file`` that ``_adopt_session_credential``
+                    # would take again; and the store's pure write, because
+                    # ``_post_backup_write`` would mark stale the very profile
+                    # being captured.
+                    ahead = self._session_profile_ahead(
+                        account_num, email, org_uuid
+                    )
+                    if ahead is not None:
+                        try:
+                            self._store._write_account_credentials(
+                                account_num, email, ahead
+                            )
+                        except Exception:
+                            # The backup still holds the consumed generation,
+                            # so recovering from it would spend a dead grant.
+                            # Defer; the next pass adopts at the gate.
+                            self._logger.warning(
+                                "Could not adopt account %s's session profile "
+                                "credential under the recovery's locks; "
+                                "deferring its usage to the next pass.",
+                                account_num, exc_info=True,
+                            )
+                            return _defer(force_refresh)
+                        backup = ahead
+                        backup_fp = oauth.credential_fingerprint(backup)
+                        backup_oauth = oauth.extract_oauth_data(backup)
+                        backup_usable = bool(
+                            backup_oauth
+                            and backup_oauth.get("accessToken")
+                            and backup_oauth.get("refreshToken")
+                        )
                 live = self._read_credentials()
                 if live is None:
                     # Read ERROR (locked keychain, unreadable store) — not
