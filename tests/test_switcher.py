@@ -3648,29 +3648,65 @@ class TestActiveSlotWithASessionProfile:
         recovery is about to POST. Re-asked under the locks, the recovery
         POSTs nothing and strikes nobody.
         """
+        from contextlib import contextmanager
+
+        from claude_swap.claude_locks import (
+            claude_credentials_lock as real_cc_lock,
+        )
+        from claude_swap.locking import FileLock as real_file_lock
+
         expired = _oauth_creds("sk-active", -3600)
         profile = _oauth_creds("sk-session", 7200)
         switcher = self._switcher(sample_sequence_data)
         switcher._write_account_credentials("1", self.EMAIL, expired)
         self._seed_profile(switcher, profile)
 
-        # Idle at the gate and at adoption's own re-probe; live by the time the
-        # recovery holds its locks.
-        probes = [([], True), ([], True), ([4242], True)]
-        seen: list[int] = []
+        # The session appears exactly when the recovery owns its locks, so a
+        # re-check moved anywhere before the acquisition reads IDLE and fails
+        # this test. Every probe records how many locks were held when it was
+        # asked: the gate's is asked with none, adoption's own re-probe under
+        # its FileLock, and the recovery's under all three.
+        held = {"file": 0, "cc": 0}
+        asked: list[tuple[int, int]] = []
 
         def probe(_session_dir):
-            seen.append(1)
-            return probes[min(len(seen) - 1, len(probes) - 1)]
+            under_the_locks = held["cc"] > 0
+            asked.append((held["file"], held["cc"]))
+            return ([4242] if under_the_locks else [], True)
+
+        @contextmanager
+        def counting_file_lock(*args, **kwargs):
+            with real_file_lock(*args, **kwargs):
+                held["file"] += 1
+                try:
+                    yield
+                finally:
+                    held["file"] -= 1
+
+        @contextmanager
+        def counting_cc_lock(*args, **kwargs):
+            with real_cc_lock(*args, **kwargs):
+                held["cc"] += 1
+                try:
+                    yield
+                finally:
+                    held["cc"] -= 1
 
         with patch.object(switcher, "_read_credentials", return_value=expired), \
              patch("claude_swap.process_detection.scan_env_bound_claude", probe), \
+             patch("claude_swap.switcher.FileLock", counting_file_lock), \
+             patch("claude_swap.switcher.claude_credentials_lock",
+                   counting_cc_lock), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
             record = switcher._fetch_active_usage("1", self.EMAIL, expired)
 
-        assert len(seen) == 3, "the recovery never re-asked under its own locks"
+        assert asked[0] == (0, 0), "the gate probed while holding a lock"
+        assert asked[-1] == (2, 1), (
+            "the recovery never re-asked while holding the consume, global, "
+            "and Claude Code locks"
+        )
         post.assert_not_called()
         assert record.struck_fp is None
         assert record.sentinel == USAGE_TOKEN_EXPIRED
@@ -3709,6 +3745,7 @@ class TestActiveSlotWithASessionProfile:
             "an adoption write failure on one slot dropped another slot's row"
         )
         assert records["1"].sentinel == USAGE_TOKEN_EXPIRED
+        assert records["1"].struck_fp is None
         post.assert_not_called()
 
     def test_a_generation_rotated_during_the_lock_wait_is_the_one_posted(
