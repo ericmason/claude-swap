@@ -2761,12 +2761,25 @@ class ClaudeAccountSwitcher:
         a live instance logs it out mid-conversation.
 
         Distinct from :meth:`_live_session_pids`, which is scan-shaped and
-        feeds display and usage heuristics that want a PID list rather than a
-        verdict.
+        drops the unreadable count, so it answers "which PIDs" rather than
+        "could anything be live" and must not be reused here.
         """
-        if self._live_session_pids(account_num, email):
-            return True
+        from claude_swap.session import scan_live_sessions
+
         session_dir = self._session_dir(account_num, email)
+        sessions, unreadable = scan_live_sessions(session_dir)
+        if sessions:
+            return True
+        if unreadable:
+            # A record we could not read may name a live PID. Same rule as
+            # profile_is_quiescent, which this method is the guard side of:
+            # unreadable is never absent.
+            self._logger.debug(
+                "Account %s's session profile has %s unreadable session "
+                "record(s); deferring credential invalidation.",
+                account_num, unreadable,
+            )
+            return True
         if not session_dir.is_dir():
             # No profile to run against, so nothing can be live in it — and
             # the caller's other branch has nothing to invalidate either. The

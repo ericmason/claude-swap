@@ -1800,6 +1800,32 @@ class TestGuards:
             "live session creds", expectation
         assert session_mod.is_session_stale(session_dir)
 
+    def test_an_unreadable_session_record_defers_the_backup_write(
+        self, seeded_switcher
+    ):
+        """A record we could not read may name a live PID. The guard asked for
+        a PID LIST, which drops the unreadable count, so an unreadable record
+        plus a clean probe invalidated the credentials anyway — the same
+        mid-session logout profile_is_quiescent already refuses."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("live session creds")
+        sessions = session_dir / "sessions"
+        sessions.mkdir(exist_ok=True)
+        (sessions / "4242.json").write_text("{ not json")
+
+        with patch("claude_swap.process_detection.scan_env_bound_claude",
+                   return_value=([], True)):
+            seeded_switcher._write_account_credentials(
+                ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+            )
+
+        assert (session_dir / ".credentials.json").read_text() == \
+            "live session creds"
+        assert session_mod.is_session_stale(session_dir)
+
     def test_a_quiet_profile_is_still_invalidated_outright(self, seeded_switcher):
         """The guard must not become a permanent deferral: with the registry
         empty AND the probe clean, the credentials still go."""

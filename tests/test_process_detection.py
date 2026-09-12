@@ -16,8 +16,11 @@ import pytest
 from claude_swap.process_detection import (
     ClaudeSession,
     ProcArgs,
-    _is_claude_argv,
-    _is_claude_argv_tokens,
+    ARGV_CLAUDE,
+    ARGV_OTHER,
+    ARGV_UNKNOWN,
+    _classify_argv,
+    _classify_argv_tokens,
     scan_env_bound_claude,
     IdeInstance,
     get_claude_dir,
@@ -398,7 +401,9 @@ def fallback_only(*pids):
     pids those refuse, so a test that fabricates `ps` output has to say which
     pids exist and that nothing structured covers them.
     """
-    with patch("claude_swap.process_detection._candidate_pids",
+    with patch("claude_swap.process_detection._cannot_host_claude",
+               return_value=False), \
+         patch("claude_swap.process_detection._candidate_pids",
                return_value=list(pids)), \
          patch("claude_swap.process_detection._read_proc_args",
                return_value=None), \
@@ -414,7 +419,9 @@ def structured(**by_pid):
     None for a pid the kernel refuses.
     """
     table = {int(k.lstrip("p")): v for k, v in by_pid.items()}
-    with patch("claude_swap.process_detection._candidate_pids",
+    with patch("claude_swap.process_detection._cannot_host_claude",
+               return_value=False), \
+         patch("claude_swap.process_detection._candidate_pids",
                return_value=list(table)), \
          patch("claude_swap.process_detection._read_proc_args",
                side_effect=lambda pid: table[pid]), \
@@ -431,7 +438,7 @@ class TestIsClaudeArgv:
         "node /opt/claude/claude --foo",
     ])
     def test_mains_are_claude(self, argv):
-        assert _is_claude_argv(argv) is True
+        assert _classify_argv(argv) == ARGV_CLAUDE
 
     @pytest.mark.parametrize("argv", [
         "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
@@ -440,7 +447,7 @@ class TestIsClaudeArgv:
     def test_the_npm_distribution_is_a_main(self, argv):
         """Its basename is cli.js, so the complete-script-name rule would file
         a real main as a worker and let its credentials be rewritten."""
-        assert _is_claude_argv(argv) is True
+        assert _classify_argv(argv) == ARGV_CLAUDE
 
     @pytest.mark.parametrize("argv", [
         "node --require setup.js /opt/nm/@anthropic-ai/claude-code/cli.js",
@@ -450,13 +457,17 @@ class TestIsClaudeArgv:
     def test_an_option_that_consumes_a_value_does_not_hide_the_script(self, argv):
         """Skipping only the option leaves its value looking like the script,
         so a live main reads as a worker called setup.js."""
-        assert _is_claude_argv(argv) is True
+        assert _classify_argv(argv) == ARGV_CLAUDE
 
     def test_a_consumed_value_is_not_mistaken_for_claude(self):
-        assert _is_claude_argv("node --require setup.js worker.js") is False
+        """Once a value has been consumed, the next token may be the tail of
+        that value rather than the script, so the flattened line cannot say
+        this is not a main. Answering "other" here let a live main whose
+        `--require` value held a space have its credentials rewritten."""
+        assert _classify_argv("node --require setup.js worker.js") == ARGV_UNKNOWN
 
     def test_a_lookalike_package_directory_is_not(self):
-        assert _is_claude_argv("node /home/claude-code-notes/build.js") is False
+        assert _classify_argv("node /home/claude-code-notes/build.js") == ARGV_OTHER
 
     @pytest.mark.parametrize("argv", [
         "node /Users/me/Application Support/claude",
@@ -465,10 +476,10 @@ class TestIsClaudeArgv:
     def test_an_interpreter_script_path_may_contain_spaces(self, argv):
         """`comm` says `node`, so the executable probe cannot rescue this one;
         rejecting it would call a live profile idle."""
-        assert _is_claude_argv(argv) is True
+        assert _classify_argv(argv) == ARGV_CLAUDE
 
     def test_a_lookalike_script_is_not_claude(self):
-        assert _is_claude_argv("node /opt/claude-helper") is False
+        assert _classify_argv("node /opt/claude-helper") == ARGV_OTHER
 
     @pytest.mark.parametrize("argv", [
         "node worker.js /tmp/claude",
@@ -478,11 +489,11 @@ class TestIsClaudeArgv:
         """A complete script name ends the script argument, so what follows is
         claude's own argv. Such a child inherits CLAUDE_CONFIG_DIR and can
         outlive its parent — reading it as a main pins the profile forever."""
-        assert _is_claude_argv(argv) is False
+        assert _classify_argv(argv) == ARGV_OTHER
 
     def test_an_interpreter_flag_does_not_hide_the_script(self):
-        assert _is_claude_argv("node --enable-source-maps /opt/app/server.js") is False
-        assert _is_claude_argv("node --enable-source-maps /opt/claude/claude") is True
+        assert _classify_argv("node --enable-source-maps /opt/app/server.js") == ARGV_OTHER
+        assert _classify_argv("node --enable-source-maps /opt/claude/claude") == ARGV_CLAUDE
 
     @pytest.mark.parametrize("argv", [
         "/bin/zsh -c source /tmp/snapshot-zsh",   # Bash-tool shell, can outlive its parent
@@ -490,7 +501,7 @@ class TestIsClaudeArgv:
         "",
     ])
     def test_inherited_strays_are_not(self, argv):
-        assert _is_claude_argv(argv) is False
+        assert _classify_argv(argv) == ARGV_OTHER
 
     @pytest.mark.parametrize("argv", [
         "node --eval setInterval(()=>{},1e3) /opt/bin/claude",
@@ -502,13 +513,13 @@ class TestIsClaudeArgv:
         """`--eval` and `--print` ARE the program, so every later token is argv
         for that one-liner. A daemon handed claude's path is not claude, and
         reading it as one pins the profile non-quiescent while it runs."""
-        assert _is_claude_argv(argv) is False
+        assert _classify_argv(argv) == ARGV_OTHER
 
     def test_inline_code_does_not_hide_a_script_that_comes_after_a_value_flag(self):
         """The two option shapes must stay apart: --require consumes a token
         and carries on, --eval ends the search."""
-        assert _is_claude_argv(
-            "node --require setup.js --enable-source-maps /opt/bin/claude") is True
+        assert _classify_argv(
+            "node --require setup.js --enable-source-maps /opt/bin/claude") == ARGV_CLAUDE
 
     @pytest.mark.parametrize("argv", [
         "node -pe \"/opt/claude-code/cli.js\";setInterval(()=>{},60000)",
@@ -520,10 +531,10 @@ class TestIsClaudeArgv:
         """Node takes `-pe` as one flag meaning print-and-eval. Matching the
         spellings `-e` and `-p` alone missed every cluster, so a daemon holding
         claude's path in its inline code read as a live main."""
-        assert _is_claude_argv(argv) is False
+        assert _classify_argv(argv) == ARGV_OTHER
 
     def test_a_cluster_with_neither_letter_still_consumes_its_value(self):
-        assert _is_claude_argv("node -r hook.js /opt/bin/claude") is True
+        assert _classify_argv("node -r hook.js /opt/bin/claude") == ARGV_CLAUDE
 
     @pytest.mark.parametrize("argv", [
         "node /Users/me/Application Support/nm/@anthropic-ai/claude-code/cli.js",
@@ -534,13 +545,13 @@ class TestIsClaudeArgv:
         """Splitting at the space made the script `/Users/me/Application`,
         which is not claude — so a live main read as an idle profile and its
         credentials were rewritten underneath it."""
-        assert _is_claude_argv(argv) is True
+        assert _classify_argv(argv) == ARGV_CLAUDE
 
     def test_the_package_directory_only_counts_at_the_entrypoint(self):
         """Matching `/claude-code/` anywhere in argv read a worker that was
         handed the entrypoint's path as the entrypoint itself."""
-        assert _is_claude_argv(
-            "node /srv/worker.js /opt/nm/@anthropic-ai/claude-code/cli.js") is False
+        assert _classify_argv(
+            "node /srv/worker.js /opt/nm/@anthropic-ai/claude-code/cli.js") == ARGV_OTHER
 
     @pytest.mark.parametrize("argv", [
         "vim /usr/local/bin/claude",
@@ -551,7 +562,7 @@ class TestIsClaudeArgv:
         """These run FROM a claude session, so they inherit CLAUDE_CONFIG_DIR
         and reach this test; treating them as mains would hold the profile
         un-quiescent for as long as the editor stayed open."""
-        assert _is_claude_argv(argv) is False
+        assert _classify_argv(argv) == ARGV_OTHER
 
 
 class TestArgvThatArrivesAlreadySeparated:
@@ -564,7 +575,7 @@ class TestArgvThatArrivesAlreadySeparated:
         ["node", "--require", "setup.js", "/opt/bin/claude"],
     ])
     def test_a_main_is_recognised_however_spacey_its_path(self, argv):
-        assert _is_claude_argv_tokens(argv) is True
+        assert _classify_argv_tokens(argv) == ARGV_CLAUDE
 
     @pytest.mark.parametrize("argv", [
         ["node", "-pe", "require('/opt/claude-code/cli.js')"],
@@ -574,7 +585,7 @@ class TestArgvThatArrivesAlreadySeparated:
         [],
     ])
     def test_a_lookalike_is_still_not_one(self, argv):
-        assert _is_claude_argv_tokens(argv) is False
+        assert _classify_argv_tokens(argv) == ARGV_OTHER
 
     def test_an_argument_holding_an_assignment_cannot_move_the_binding(
         self, tmp_path,
@@ -610,8 +621,29 @@ class TestTheKernelIsTheSource:
     def test_nul_records_keep_spaces_and_equals_signs(self):
         from claude_swap.process_detection import _split_nul_env
 
-        env = _split_nul_env([b"LS_COLORS=a b c", b"EQ=x=y", b"", b"T=1"])
-        assert env == {"LS_COLORS": "a b c", "EQ": "x=y", "T": "1"}
+        env = _split_nul_env([b"LS_COLORS=a b c", b"EQ=x=y"])
+        assert env == {"LS_COLORS": "a b c", "EQ": "x=y"}
+
+    def test_an_empty_record_ends_the_environment(self):
+        """The kernel writes the environment as one NUL-terminated run, so the
+        first empty slot is its end. Skipping past it read whatever the region
+        held before and attributed a stale binding to a live process."""
+        from claude_swap.process_detection import _split_nul_env
+
+        env = _split_nul_env([b"A=1", b"", b"CLAUDE_CONFIG_DIR=/stale"])
+        assert env == {"A": "1"}
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="KERN_PROCARGS2 is macOS")
+    def test_a_truncated_argument_area_is_unreadable_not_empty(self):
+        """A buffer holding fewer records than argc means the copy was cut
+        short. Taking the environment from what followed read argv fragments
+        as variables, so the pid looked unbound instead of unreadable."""
+        from claude_swap import process_detection as pd
+
+        short = (5).to_bytes(4, sys.byteorder) + b"/bin/x\0\0argv0\0argv1\0"
+        with patch.object(pd, "_sysctl", return_value=short), \
+             patch.object(pd, "_macos_argmax", return_value=4096):
+            assert pd._proc_args_macos(os.getpid()) is None
 
     @pytest.mark.skipif(sys.platform != "darwin", reason="KERN_PROCARGS2 is macOS")
     def test_macos_reads_this_process_back(self):
@@ -896,3 +928,101 @@ class TestProbesMustNotBeTruncated:
         from claude_swap import process_detection as pd
         for probe in (pd._ENV_PROBE_ARGV, pd._ARGV_PROBE_ARGV, pd._COMM_PROBE_ARGV):
             assert any("ww" in token for token in probe), probe
+
+
+class TestNothingWeCouldNotReadIsUnbound:
+    """"We could not look" must never answer "nobody is there"."""
+
+    def test_a_pid_no_probe_reported_is_unknown(self, tmp_path):
+        """Every `ps` probe failing left empty dicts behind, and a pid missing
+        from all three read as unbound — so a machine where the process table
+        cannot be read at all reported every profile idle and let a live
+        session's credentials be rewritten."""
+        from claude_swap import process_detection as pd
+
+        d = tmp_path / "1-acct"
+        with fallback_only(4242), \
+             patch.object(pd, "_pid_map", return_value=None):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_a_pid_with_argv_but_no_environment_probe_is_unknown(self, tmp_path):
+        """The executable and argv probes place it as a main; without the
+        combined line there is no environment to place it against."""
+        from claude_swap import process_detection as pd
+
+        d = tmp_path / "1-acct"
+
+        def only_argv(argv, label):
+            return {4242: "/usr/local/bin/claude"} if "ewwx" not in argv else None
+
+        with fallback_only(4242), patch.object(pd, "_pid_map", side_effect=only_argv):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_an_unrecognised_option_is_unknown_not_a_guess(self, tmp_path):
+        """`--inspect-port 0 /opt/bin/claude` took `0` for the script. Rather
+        than chase the flag list, an option in neither table stops the walk."""
+        assert _classify_argv("node --inspect-port 0 /opt/bin/claude") == ARGV_CLAUDE
+        assert _classify_argv("node --frobnicate 0 /opt/bin/claude") == ARGV_UNKNOWN
+        assert _classify_argv_tokens(
+            ["node", "--frobnicate", "0", "/opt/bin/claude"]) == ARGV_UNKNOWN
+
+    def test_a_flattened_line_with_an_unplaceable_token_is_unknown(self, tmp_path):
+        """`-r "/tmp/hook setup.js" /opt/bin/claude` flattens to four words, so
+        the walk drops `/tmp/hook` and reads `setup.js` as the script. It
+        cannot tell that from a real worker, so it must say so."""
+        d = tmp_path / "1-acct"
+        out = f"  4242 node -r /tmp/hook setup.js /opt/bin/claude CLAUDE_CONFIG_DIR={d}\n"
+        with TestScanEnvBoundClaude()._ps(
+                out, argv_out="  4242 node -r /tmp/hook setup.js /opt/bin/claude\n",
+                pids=(4242,)):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_the_kernel_answer_is_exact_for_the_same_argv(self, tmp_path):
+        """Separated records place every token, so the same command is settled
+        rather than deferred."""
+        d = tmp_path / "1-acct"
+        argv = ["node", "-r", "/tmp/hook setup.js", "/opt/bin/claude"]
+        with structured(p4242=ProcArgs(argv, {"CLAUDE_CONFIG_DIR": str(d)})):
+            assert scan_env_bound_claude(d) == ([4242], True)
+
+
+class TestTheCheapCheckComesFirst:
+    """Reading a megabyte of arguments for every pid on the box is the cost."""
+
+    def test_a_pid_ruled_out_cheaply_is_never_read_in_full(self, tmp_path):
+        from claude_swap import process_detection as pd
+
+        d = tmp_path / "1-acct"
+        with patch.object(pd, "_candidate_pids", return_value=[10, 11]), \
+             patch.object(pd, "_cannot_host_claude", return_value=True), \
+             patch.object(pd, "_read_proc_args") as full:
+            assert scan_env_bound_claude(d) == ([], True)
+        full.assert_not_called()
+
+    def test_a_read_that_failed_never_rules_a_pid_out(self, tmp_path):
+        """`_cannot_host_claude` answers True only from a POSITIVE read, so a
+        refused one falls through to the full read rather than shortcutting."""
+        from claude_swap import process_detection as pd
+
+        if sys.platform == "darwin":
+            with patch.object(pd, "_exec_path_macos", return_value=None):
+                assert pd._cannot_host_claude(os.getpid()) is False
+        else:
+            assert pd._cannot_host_claude(2 ** 30) is False
+
+    def test_the_scan_stops_at_the_first_main_it_finds(self, tmp_path):
+        """Every caller asks whether the profile is busy, not by whom."""
+        from claude_swap import process_detection as pd
+
+        d = tmp_path / "1-acct"
+        seen = []
+
+        def read(pid):
+            seen.append(pid)
+            return ProcArgs(["/usr/bin/claude"], {"CLAUDE_CONFIG_DIR": str(d)})
+
+        with patch.object(pd, "_candidate_pids", return_value=[10, 11, 12]), \
+             patch.object(pd, "_cannot_host_claude", return_value=False), \
+             patch.object(pd, "_read_proc_args", side_effect=read):
+            assert scan_env_bound_claude(d) == ([10], True)
+        assert seen == [10]
