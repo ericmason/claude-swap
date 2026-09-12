@@ -7200,7 +7200,8 @@ class ClaudeAccountSwitcher:
         # is refused rather than adopted or activated, because neither the
         # "nothing is rotating this family" that adoption needs nor the "the
         # backup is the current generation" that activation needs has been
-        # established.
+        # established -- unless --force, which overrides an inconclusive
+        # answer (see below) but never the LIVE-and-ahead one.
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
@@ -7228,7 +7229,7 @@ class ClaudeAccountSwitcher:
                         "credential is adopted into the backup once nothing runs "
                         "against it), or switch to another account."
                     )
-                if liveness.state == PROFILE_UNKNOWN:
+                if liveness.state == PROFILE_UNKNOWN and not force_activate:
                     raise SwitchError(
                         f"Account-{target_account} ({pre_email}) has "
                         f"{liveness.detail}. The stored backup may already be a "
@@ -7237,16 +7238,36 @@ class ClaudeAccountSwitcher:
                         "own credential cannot be adopted into the backup until "
                         "the profile is known to be idle. Exit any Claude "
                         "instance running against this account (or fix the "
-                        "unreadable session record), then retry."
+                        "unreadable session record), then retry, or pass "
+                        "--force to activate the backup as it stands."
                     )
-                msg = (
-                    f"Account-{target_account} ({pre_email}) has "
-                    f"{liveness.detail}. Running the same account as both the "
-                    "default login and a session can make one copy's token go "
-                    "stale if the server rotates it. If the session later fails "
-                    "to authenticate, exit it and re-run "
-                    f"'cswap run {target_account}'."
-                )
+                if liveness.state == PROFILE_UNKNOWN:
+                    # --force overrides an INCONCLUSIVE answer, never a
+                    # positive one: the LIVE-and-ahead refusal above stays,
+                    # because there the backup is known to be consumed. Here
+                    # nothing was established either way, and on a shared host
+                    # (another user's claude, whose environment nothing can
+                    # read) the answer never becomes conclusive no matter what
+                    # the user exits -- so refusing forever would leave every
+                    # idle profile unswitchable. Say what is being skipped.
+                    msg = (
+                        f"Account-{target_account} ({pre_email}) has "
+                        f"{liveness.detail}, so its session profile could not be "
+                        "confirmed idle; --force activates the stored backup as "
+                        "it stands. If a session has rotated past it, the backup "
+                        "is a consumed generation and its first refresh fails "
+                        f"with invalid_grant -- re-add the account "
+                        f"('cswap --add-account') if that happens."
+                    )
+                else:
+                    msg = (
+                        f"Account-{target_account} ({pre_email}) has "
+                        f"{liveness.detail}. Running the same account as both the "
+                        "default login and a session can make one copy's token go "
+                        "stale if the server rotates it. If the session later fails "
+                        "to authenticate, exit it and re-run "
+                        f"'cswap run {target_account}'."
+                    )
                 if emit_output:
                     warning(msg)
                 else:

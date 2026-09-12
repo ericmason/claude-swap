@@ -1664,6 +1664,62 @@ class TestGuards:
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
         assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
 
+    def test_force_activates_an_unprobeable_profile_and_warns(
+        self, seeded_switcher, monkeypatch
+    ):
+        """An inconclusive answer is what --force is for.
+
+        On a shared host the process table holds another user's claude whose
+        environment nothing can read, so the answer never becomes conclusive
+        however many of his own sessions the user exits. Refusing forever left
+        every idle profile unswitchable; --force proceeds and says what it
+        could not confirm.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude",
+            lambda d: ([], False),
+        )
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
+
+        op = seeded_switcher._perform_switch(
+            ACCOUNT_NUM, emit_output=False, force_activate=True
+        )
+
+        assert any("could not be confirmed idle" in w for w in op["warnings"])
+        assert any("consumed generation" in w for w in op["warnings"])
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == int(
+            ACCOUNT_NUM
+        )
+
+    def test_force_still_refuses_a_live_profile_that_is_ahead(
+        self, seeded_switcher, monkeypatch
+    ):
+        """--force overrides an inconclusive answer, not a positive one. The
+        profile has rotated past the backup, so activating it cannot do
+        anything but fail, and no flag makes that worth doing."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        make_live(session_dir)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+            seeded_switcher._perform_switch(
+                ACCOUNT_NUM, emit_output=False, force_activate=True
+            )
+
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
     def test_switch_refuses_an_unprobeable_profile_even_on_one_generation(
         self, seeded_switcher, monkeypatch
     ):
