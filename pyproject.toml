@@ -64,7 +64,11 @@ pythonpath = ["src"]
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
 # store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
 # cores) and this box both get the cores they have.
-addopts = "-n auto --dist loadgroup"
+# `-rs` prints every skip with its reason. A skip that hides its reason is a
+# test nobody knows stopped running: the node-major guard in
+# test_process_detection.py skips with the command that regenerates its
+# fixture, and in CI that advice was in a string nothing ever printed.
+addopts = "-n auto --dist loadgroup -rs"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
