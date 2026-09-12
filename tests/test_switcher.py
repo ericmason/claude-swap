@@ -3637,6 +3637,43 @@ class TestActiveSlotWithASessionProfile:
 
         post.assert_called_once()
 
+    def test_a_session_that_starts_during_the_lock_wait_keeps_its_grant(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The gate's answer is only as fresh as the lock wait that follows it.
+
+        `claude --resume` reuses a valid profile without taking any lock of
+        ours, so a session can start while the recovery waits for the consume,
+        global, and Claude Code locks — and then rotate the very family the
+        recovery is about to POST. Re-asked under the locks, the recovery
+        POSTs nothing and strikes nobody.
+        """
+        expired = _oauth_creds("sk-active", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", self.EMAIL, expired)
+        self._seed_profile(switcher, profile)
+
+        # Idle at the gate and at adoption's own re-probe; live by the time the
+        # recovery holds its locks.
+        probes = [([], True), ([], True), ([4242], True)]
+        seen: list[int] = []
+
+        def probe(_session_dir):
+            seen.append(1)
+            return probes[min(len(seen) - 1, len(probes) - 1)]
+
+        with patch.object(switcher, "_read_credentials", return_value=expired), \
+             patch("claude_swap.process_detection.scan_env_bound_claude", probe), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            record = switcher._fetch_active_usage("1", self.EMAIL, expired)
+
+        assert len(seen) == 3, "the recovery never re-asked under its own locks"
+        post.assert_not_called()
+        assert record.struck_fp is None
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
 
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""

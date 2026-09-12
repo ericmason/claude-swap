@@ -4573,6 +4573,28 @@ class ClaudeAccountSwitcher:
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
+                # Asked again IN FULL, now that the locks are held: the gate
+                # above answered on a profile that was idle before this
+                # acquisition waited behind whoever held these locks, and
+                # `claude --resume` reuses a valid profile without taking any
+                # lock of ours (session.py), so a session can start during the
+                # wait and rotate the family the recovery below is about to
+                # POST. Same condition as the gate, so a slot with no profile
+                # dir still pays nothing. The residual window this leaves is
+                # written down once, at the consume gate's own re-probe in
+                # ``_consume_backup_grant_locked``.
+                if session_dir.is_dir():
+                    relive = self._session_profile_liveness(
+                        account_num, email
+                    )
+                    if relive.state != PROFILE_IDLE:
+                        self._logger.info(
+                            "Account %s has %s as of the recovery's locks; "
+                            "deferring rather than consuming a grant the "
+                            "profile may already have spent.",
+                            account_num, relive.detail,
+                        )
+                        return _defer(force_refresh)
                 live = self._read_credentials()
                 if live is None:
                     # Read ERROR (locked keychain, unreadable store) — not
