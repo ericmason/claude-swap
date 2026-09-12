@@ -1851,20 +1851,23 @@ class TestOwnershipIsTheLastReadingNotTheFirst:
                 argv_out=argv, comm_out="", pids=(4242,), uid_out="  4242 0\n"):
             assert scan_env_bound_claude(d) == ([], True)
 
-    def test_another_users_claude_is_ruled_out_on_ownership(self, tmp_path):
+    def test_an_unreadable_claude_shape_is_never_ruled_out_by_uid(self, tmp_path):
         """argv says main, the environment is withheld, and the owner is not
-        us. The profile is under THIS user's home and its credentials are this
-        user's keychain entries, so that claude is somebody else's session and
-        cannot be the one about to be rewritten. Deferring instead wedged
-        every profile on a shared host, with nothing the user could exit."""
+        us. A different uid is not proof of a different profile: root can run
+        `claude` with CLAUDE_CONFIG_DIR pointing at this user's profile and
+        read its credentials, and the environment that would say so is exactly
+        what another user's process withholds. Ruling it out would make
+        unreadability the evidence, and let the backup grant be spent under a
+        live session; --force is what keeps the unknown from wedging the slot.
+        """
         d = tmp_path / "1-acct"
         argv = "  4242 /usr/local/bin/claude --resume x\n"
         with TestScanEnvBoundClaude()._ps(
                 "", argv_out=argv, comm_out="", pids=(4242,),
                 uid_out="  4242 0\n"):
-            assert scan_env_bound_claude(d) == ([], True)
+            assert scan_env_bound_claude(d) == ([], False)
 
-    def test_our_own_unreadable_claude_shape_still_defers(self, tmp_path):
+    def test_our_own_unreadable_claude_shape_defers_too(self, tmp_path):
         """Same shape owned by us: it may be the session, so it defers."""
         d = tmp_path / "1-acct"
         argv = "  4242 /usr/local/bin/claude --resume x\n"
@@ -1873,11 +1876,25 @@ class TestOwnershipIsTheLastReadingNotTheFirst:
                 uid_out=f"  4242 {os.geteuid()}\n"):
             assert scan_env_bound_claude(d) == ([], False)
 
-    def test_the_structured_path_rules_out_another_users_claude_too(self, tmp_path):
+    def test_another_users_unrecognised_program_is_ruled_out(self, tmp_path):
+        """Ownership still settles everything a claude-shaped argv does not:
+        another uid's shell, daemon, or program nobody listed cannot be this
+        user's session, and deferring on all of them left no profile on a
+        shared host ever quiescent."""
+        d = tmp_path / "1-acct"
+        argv = "  4242 /opt/tools/assistant --serve\n"
+        with TestScanEnvBoundClaude()._ps(
+                "", argv_out=argv, comm_out="", pids=(4242,),
+                uid_out="  4242 0\n"):
+            assert scan_env_bound_claude(d) == ([], True)
+
+    def test_the_structured_path_defers_on_a_claude_shape_too(self, tmp_path):
+        """Linux withholds another user's environ, so a root-owned claude
+        reports unknown there for the same reason."""
         d = tmp_path / "1-acct"
         with structured(p4242=ProcArgs(["/usr/local/bin/claude", "--resume"], None)):
             with patch("claude_swap.process_detection._proc_uid", return_value=0):
-                assert scan_env_bound_claude(d) == ([], True)
+                assert scan_env_bound_claude(d) == ([], False)
 
     def test_the_structured_path_defers_on_our_own_claude_shape(self, tmp_path):
         d = tmp_path / "1-acct"

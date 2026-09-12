@@ -1318,7 +1318,7 @@ class _PsFallback:
                                    else self.argvs.get(pid))[0]
         return None
 
-    def _unread(self, pid: int) -> str:
+    def _unread(self, pid: int, verdict: str) -> str:
         """The answer for a pid whose ENVIRONMENT could not be read.
 
         Ownership is consulted only at this point, never before. A reading
@@ -1328,21 +1328,28 @@ class _PsFallback:
         alone. Asking about the owner first rejected a readable, matching
         claude argv on the strength of its uid.
 
-        Where nothing could be read, ownership is the last reading left, and
-        there it rules out another uid's process WHATEVER its argv looked
-        like. The profile directory lives under this user's home and its
-        credentials are this user's keychain and file entries, so a claude
-        running as somebody else cannot be the session about to have its
-        credentials rewritten -- a root-owned `claude` is another user's
-        session, not this one's. Exempting a claude-shaped argv from the rule
-        instead left every such process answering "unknown" for good (another
-        user's environment is precisely what `ps` will not show), and on a
-        shared host that made every idle profile unswitchable with nothing the
-        user could exit to clear it.
+        Where nothing could be read, ownership rules out another uid's
+        process -- but only one that argv did not place as a claude. A
+        different uid is not proof of a different profile: on Linux root can
+        run `claude` with CLAUDE_CONFIG_DIR pointing at a directory under this
+        user's home, the file backend reads that directory's
+        `.credentials.json`, and root's permissions do not exclude it. Since
+        the environment is exactly what `ps` withholds for another user's
+        process, ruling such a claude out would turn "we could not read it"
+        into evidence that it is somewhere else, and let the backup grant be
+        spent under a live session.
+
+        So a claude-shaped argv owned by somebody else is UNKNOWN, and the
+        trade that makes that acceptable is `--force`: an unknown no longer
+        refuses a switch outright, it refuses one that was not forced, so a
+        root-owned claude makes a profile switchable on an explicit force
+        rather than permanently unswitchable. Anything else another uid owns
+        -- a shell, a daemon, a program nobody listed -- is ruled out here as
+        it always was.
 
         An owner that could not be read still rules out nothing.
         """
-        if self._is_ours(pid) is False:
+        if verdict != ARGV_CLAUDE and self._is_ours(pid) is False:
             return _UNBOUND
         return _UNKNOWN
 
@@ -1388,7 +1395,7 @@ class _PsFallback:
         if self.combined is None or pid not in self.combined:
             # Either a main, or a pid argv could not place; no environment to
             # settle it against either way.
-            return self._unread(pid)
+            return self._unread(pid, verdict)
         _, env = _split_argv_env(
             self.combined[pid],
             None if self.argvs is None else self.argvs.get(pid),
@@ -1397,7 +1404,7 @@ class _PsFallback:
             # argv with no environment after it: macOS withholds the
             # environment of another user's process and of the platform
             # binaries it protects.
-            return self._unread(pid)
+            return self._unread(pid, verdict)
         pairs, ambiguous = _env_pairs(env)
         value = pairs.get("CLAUDE_CONFIG_DIR")
         if ambiguous:
@@ -1446,23 +1453,34 @@ def _scan_pid(pid: int, target: str) -> str:
         # environ, so argv is the only reading available.
         if verdict == ARGV_OTHER and recognised:
             return _UNBOUND
-        # The environment that would settle this pid is withheld, so ownership
-        # is the last reading left, and only here. It rules out another uid's
-        # process whatever its argv looked like: the profile directory lives
-        # under this user's home and its credentials are this user's keychain
-        # and file entries, so a claude running as somebody else cannot be the
-        # session about to have its credentials rewritten -- it is that user's
-        # session, not this one's. Exempting a claude-shaped argv left every
-        # root-owned or other-user claude answering "unknown" for good, which
-        # on a shared host made every idle profile unswitchable with nothing
-        # the user could exit to clear it. A readable environment naming this
-        # profile still settles the pid whoever owns it; that is decided above.
-        try:
-            owner = _proc_uid(pid)
-        except ProcessLookupError:
-            return _GONE
-        if owner is not None and owner != os.geteuid():
-            return _UNBOUND
+        if verdict != ARGV_CLAUDE:
+            # Not claude-shaped, and the environment that would settle it is
+            # withheld. Ownership is the last reading left, and only here: a
+            # shell, a daemon, or a program nobody listed, owned by another
+            # uid, is not the session about to have its credentials rewritten.
+            # Without this the machine's root-owned daemons deferred forever
+            # and no profile was ever quiescent.
+            #
+            # A claude-shaped argv is NOT ruled out this way, because a
+            # different uid is not proof of a different profile: root can run
+            # `claude` with CLAUDE_CONFIG_DIR pointing at a directory under
+            # this user's home, the file backend reads that directory's
+            # `.credentials.json`, and root's permissions do not exclude it.
+            # Linux withholds other users' environ, which is the one reading
+            # that would settle it, so ruling it out would turn "we could not
+            # read it" into evidence that it is bound somewhere else -- and
+            # then an IDLE verdict lets the backup grant be spent under a live
+            # session. It answers unknown instead, and `--force` is what keeps
+            # that from making the profile permanently unswitchable: an
+            # inconclusive answer refuses an unforced switch, not every
+            # switch. A readable environment naming this profile still settles
+            # the pid whoever owns it; that is decided above.
+            try:
+                owner = _proc_uid(pid)
+            except ProcessLookupError:
+                return _GONE
+            if owner is not None and owner != os.geteuid():
+                return _UNBOUND
         logger.debug("pid %s could not be settled by argv alone and its "
                      "environment is not readable", pid)
         return _UNKNOWN
