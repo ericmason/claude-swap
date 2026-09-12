@@ -68,4 +68,4 @@ To go back to stock and lose the patch, run `uv tool install --force claude-swap
 uv run pytest -q
 ```
 
-2479 passed, 5 skipped. The skips are three macOS Keychain tests that only run on GitHub Actions and two `/proc` tests that only run on Linux, and each prints its reason (`-rs` is in the pytest addopts). The new coverage is `tests/test_active_slot_identity_oracle.py` (35 tests, including `TestCachedVerdictsCannotGoStale` and `TestAnIdentityTooPartialToPlaceIsNotCached`) plus additions to `tests/test_process_detection.py` and `tests/test_session.py`.
+2487 passed, 5 skipped. The skips are three macOS Keychain tests that only run on GitHub Actions and two `/proc` tests that only run on Linux, and each prints its reason (`-rs` is in the pytest addopts). The new coverage is `tests/test_active_slot_identity_oracle.py` (35 tests, including `TestCachedVerdictsCannotGoStale` and `TestAnIdentityTooPartialToPlaceIsNotCached`) plus additions to `tests/test_process_detection.py` and `tests/test_session.py`.
