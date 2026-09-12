@@ -1,8 +1,11 @@
 """Node option arity tables, generated from this machine's node.
 
 Do not edit by hand. Regenerate with `uv run python
-tools/regen_node_options.py`; tests/test_process_detection.py fails when
-these tables and the local `node --help` disagree.
+tools/regen_node_options.py`. tests/test_process_detection.py fails when
+the local `node --help` files an option on the other arity side from these
+tables, whatever version that node is. It compares the two option lists
+option-for-option only when the local node's major version matches
+GENERATED_FROM, because V8 adds and drops dozens of options every major.
 """
 
 from __future__ import annotations

@@ -1,7 +1,9 @@
 """Regenerate src/claude_swap/_node_options.py from the local `node`.
 
 Run it after a node upgrade, when tests/test_process_detection.py reports that
-the shipped tables no longer match this machine's interpreter:
+the shipped tables disagree with this machine's interpreter about an option's
+arity, or skips its option-for-option comparison because the local node is a
+different major from the one the tables came from:
 
     uv run python tools/regen_node_options.py
 """
@@ -38,8 +40,11 @@ def main() -> int:
     OUT.write_text(
         '"""Node option arity tables, generated from this machine\'s node.\n\n'
         "Do not edit by hand. Regenerate with `uv run python\n"
-        "tools/regen_node_options.py`; tests/test_process_detection.py fails when\n"
-        "these tables and the local `node --help` disagree.\n"
+        "tools/regen_node_options.py`. tests/test_process_detection.py fails when\n"
+        "the local `node --help` files an option on the other arity side from these\n"
+        "tables, whatever version that node is. It compares the two option lists\n"
+        "option-for-option only when the local node's major version matches\n"
+        "GENERATED_FROM, because V8 adds and drops dozens of options every major.\n"
         '"""\n\nfrom __future__ import annotations\n\n'
         f'GENERATED_FROM = "{version}"\n\n'
         + block("NODE_VALUE_FLAGS", value)
