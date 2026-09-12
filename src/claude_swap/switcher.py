@@ -5269,6 +5269,22 @@ class ClaudeAccountSwitcher:
                     session_creds = None
             except LockError:
                 session_creds = None
+            except Exception:
+                # Adoption writes the slot backup, and the credential store
+                # re-raises a write failure (full disk, a permission change)
+                # rather than swallowing it. This runs in the collector's
+                # worker thread, whose return value lands in
+                # ``dict(executor.map(...))``, so an exception escaping here
+                # ends the whole pass and drops every other account's usage
+                # with it. Keep ``session_creds`` set: the backup was not
+                # advanced, so its grant is still the consumed one, and the
+                # profile head below serves this slot's usage read-only. One
+                # account goes read-only; the rest still collect.
+                self._logger.warning(
+                    "Could not adopt account %s's session profile credential; "
+                    "serving its usage read-only from the profile instead.",
+                    num, exc_info=True,
+                )
         if session_creds:
             session_oauth = oauth.extract_oauth_data(session_creds)
             if session_oauth and session_oauth.get("accessToken"):

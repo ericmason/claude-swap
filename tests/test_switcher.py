@@ -1005,6 +1005,55 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("refresh_via") is not None
         assert switcher.read_account_credentials("2", "test@example.com") == session
 
+    def test_an_adoption_write_failure_only_costs_this_accounts_row(
+        self, temp_home: Path
+    ):
+        """Adoption writes the slot backup, and the store re-raises a write
+        failure (full disk, a permission change) rather than swallowing it.
+
+        The fetch runs in a pool worker whose result goes into
+        `dict(executor.map(...))`, so an escaping OSError ends the whole usage
+        pass and every other account loses its row too. This slot goes
+        read-only on the profile's own credential — the backup was not
+        advanced, so its grant is still the consumed one — and the pass
+        finishes.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        fresh = _oauth_creds("sk-other", 7200)
+        switcher._write_account_credentials("1", "test@example.com", backup)
+        switcher._write_account_credentials("2", "account2@example.com", fresh)
+        session_dir = switcher._session_dir("1", "test@example.com")
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(session)
+
+        infos = [
+            (1, "test@example.com", "", "", False, backup, ""),
+            (2, "account2@example.com", "", "", False, fresh, ""),
+        ]
+        with patch("claude_swap.process_detection.scan_env_bound_claude",
+                   side_effect=lambda d: ([], True)), \
+             patch.object(switcher, "_adopt_session_credential",
+                          side_effect=OSError("No space left on device")), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})
+                   ) as mock_fetch:
+            records = switcher._run_usage_fetches(infos)
+
+        assert set(records) == {"1", "2"}
+        assert records["2"].usage is not None, (
+            "an adoption write failure on one slot dropped another slot's row"
+        )
+        assert records["1"].usage == {"five_hour": {"pct": 5}}
+        assert records["1"].struck_fp is None
+        calls = {c.args[0]: c for c in mock_fetch.call_args_list}
+        assert calls["1"].args[2] == session
+        assert calls["1"].kwargs.get("is_active") is True
+        assert calls["1"].kwargs.get("refresh_via") is None
+        assert switcher.read_account_credentials("1", "test@example.com") == backup
+
     def test_live_session_ahead_of_backup_is_not_adopted(self, temp_home: Path):
         """A live claude owns its profile's family: read-only fetch, backup untouched."""
         switcher = ClaudeAccountSwitcher()
@@ -3797,6 +3846,8 @@ class TestActiveSlotWithASessionProfile:
         )
         assert record.struck_fp is None
         assert record.usage == {"five_hour": {"pct": 5}}
+
+
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
 
