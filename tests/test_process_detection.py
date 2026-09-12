@@ -1207,6 +1207,56 @@ class TestProbesMustNotBeTruncated:
             assert any("ww" in token for token in probe), probe
 
 
+class TestThePsFallbackSharesOneDeadline:
+    """Four `ps` probes, one ten-second budget between them.
+
+    The fallback is built inside the consume gate's and adoption's lock, and
+    other waiters for that lock acquire with a ten-second budget of their own,
+    so four sequential ten-second probes could time a `cswap switch` out while
+    cswap was merely reading the process table.
+    """
+
+    def test_the_probes_share_the_budget_and_a_starved_one_is_skipped(self):
+        import subprocess
+
+        from claude_swap import process_detection as pd
+
+        now = [0.0]
+        timeouts = []
+
+        def fake_run(argv, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            now[0] += 4.0
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(pd.time, "monotonic", lambda: now[0]), \
+             patch.object(pd.subprocess, "run", side_effect=fake_run):
+            fallback = pd._PsFallback()
+
+        # 10 for the first, what is left of the budget for each one after it,
+        # and nothing at all for the probe that had no time left.
+        assert timeouts == [10.0, 6.0, 2.0]
+        assert fallback.uids is None
+
+    def test_a_skipped_probe_leaves_the_pid_unknown_not_unbound(self):
+        """The bound may cost an answer; it may never invent one. A probe that
+        did not run is absent, exactly as a timed-out one is."""
+        import subprocess
+
+        from claude_swap import process_detection as pd
+
+        now = [0.0]
+
+        def fake_run(argv, **kwargs):
+            now[0] += 4.0
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(pd.time, "monotonic", lambda: now[0]), \
+             patch.object(pd.subprocess, "run", side_effect=fake_run), \
+             patch.object(pd, "is_pid_alive", return_value=True):
+            assert pd._PsFallback().verdict(4242, "/tmp/1-acct") == "unknown"
+
+
 class TestNothingWeCouldNotReadIsUnbound:
     """"We could not look" must never answer "nobody is there"."""
 
@@ -1244,7 +1294,7 @@ class TestNothingWeCouldNotReadIsUnbound:
 
         d = tmp_path / "1-acct"
 
-        def only_argv(argv, label):
+        def only_argv(argv, label, deadline=None):
             return {4242: "/usr/local/bin/claude"} if "ewwx" not in argv else None
 
         with fallback_only(4242), patch.object(pd, "_pid_map", side_effect=only_argv):

@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -646,16 +647,37 @@ def _unlikely_location(executable: str) -> bool:
             or _BUNDLE_EXECUTABLE.search(executable) is not None)
 
 
-def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str] | None:
+# Ceiling for one `ps` probe. A probe that outruns it is an absent answer, so
+# the ceiling is the point past which waiting costs more than not knowing.
+_PROBE_TIMEOUT_S = 10.0
+
+
+def _pid_map(
+    argv: tuple[str, ...], label: str, deadline: float | None = None
+) -> dict[int, str] | None:
     """pid -> trailing field, for a `ps` format whose last column is one value.
 
     The value is taken with ``partition`` rather than ``split``, so a path
     containing spaces survives intact — which is the whole reason both callers
     exist rather than reusing the combined probe.
+
+    ``deadline`` is a ``time.monotonic`` instant several probes share, so a run
+    of them is bounded by one budget instead of one timeout each. A probe with
+    no time left is not run, which is the same ABSENT answer a timed-out one
+    gives: the caller reports the pids it covered as unknown rather than
+    unbound, so the bound can only make an answer less certain, never wrong.
     """
+    timeout = _PROBE_TIMEOUT_S
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            logger.warning("%s skipped; the process-table budget was spent by "
+                           "the earlier probes", label)
+            return None
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, errors="replace", timeout=10
+            argv, capture_output=True, text=True, errors="replace",
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         # ValueError covers UnicodeDecodeError, which is NOT an OSError or a
@@ -1238,11 +1260,23 @@ class _PsFallback:
     thing that must not read as "nobody is there".
     """
 
+    # One budget for all four probes together, not ten seconds each. This
+    # object is built inside the consume gate's and adoption's lock, whose
+    # other waiters acquire with a ten-second budget of their own (`cswap
+    # switch`), so four sequential ten-second probes could time a waiter out
+    # while merely reading `ps`. Spending the budget answers "unknown" for the
+    # pids the skipped probes would have covered, which every caller of this
+    # treats as a reason to do nothing -- the safe direction.
+    _BUDGET_S = 10.0
+
     def __init__(self) -> None:
-        self.combined = _pid_map(_ENV_PROBE_ARGV, "CLAUDE_CONFIG_DIR probe")
-        self.argvs = _pid_map(_ARGV_PROBE_ARGV, "argv probe")
-        self.executables = _pid_map(_COMM_PROBE_ARGV, "executable probe")
-        self.uids = _pid_map(_UID_PROBE_ARGV, "owner probe")
+        deadline = time.monotonic() + self._BUDGET_S
+        self.combined = _pid_map(
+            _ENV_PROBE_ARGV, "CLAUDE_CONFIG_DIR probe", deadline
+        )
+        self.argvs = _pid_map(_ARGV_PROBE_ARGV, "argv probe", deadline)
+        self.executables = _pid_map(_COMM_PROBE_ARGV, "executable probe", deadline)
+        self.uids = _pid_map(_UID_PROBE_ARGV, "owner probe", deadline)
 
     def _is_ours(self, pid: int) -> bool | None:
         """Whether this process is owned by the user running this tool."""

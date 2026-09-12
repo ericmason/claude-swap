@@ -2200,7 +2200,9 @@ class ClaudeAccountSwitcher:
         # file reads without probing at all. LIVE and UNKNOWN both refuse --
         # the profile holds the current generation in both, and the caller's
         # own liveness branch (read-only fetch, skipped freshen) is the route
-        # that belongs here.
+        # that belongs here. This is the cheap early exit, not the decision:
+        # the answer that governs the write is taken again under the lock
+        # below, where the residual window is spelled out.
         liveness = self._session_profile_liveness(account_num, email)
         if liveness.state != PROFILE_IDLE:
             self._logger.info(
@@ -2276,6 +2278,34 @@ class ClaudeAccountSwitcher:
                     return oauth.RefreshOutcome(None, "transient")
                 refresh_input = current
                 input_oauth = oauth.extract_oauth_data(refresh_input)
+                # Asked again IN FULL, now that the lock is held, because the
+                # pre-lock answer is only as fresh as the wait that followed
+                # it. `claude --resume` reuses a valid profile and returns from
+                # `setup_session` before taking any lock of ours (session.py),
+                # so a session can start while this call waits — and then the
+                # copy below takes a live profile's credential into the backup
+                # and the POST spends its grant, leaving whichever actor
+                # refreshes second holding a consumed generation. The re-probe
+                # costs one process-table walk per slot that reaches the lock.
+                #
+                # THE RESIDUAL WINDOW, stated plainly (adoption's own re-probe
+                # in ``_adopt_session_credential`` leaves the same one, and
+                # this is the single place it is written down): session startup
+                # does not take this lock, so a session that starts between
+                # this re-probe and the write below is not excluded. That
+                # window is the probe's own duration, and closing it would take
+                # a lock on the startup path that nothing there has any reason
+                # to wait for. What the re-probe buys is the lock wait, which
+                # is unbounded by comparison.
+                liveness = self._session_profile_liveness(account_num, email)
+                if liveness.state != PROFILE_IDLE:
+                    self._logger.info(
+                        "Account %s has %s as of this lock; deferring the "
+                        "backup refresh rather than consuming a grant the "
+                        "profile may already have spent.",
+                        account_num, liveness.detail,
+                    )
+                    return oauth.RefreshOutcome(None, "session-not-idle")
                 # Session-profile precedence: only when nothing owns the
                 # profile (a live claude rotates its own tokens — #97's rule)
                 # and the profile identity — org included: two slots may share
@@ -3058,7 +3088,9 @@ class ClaudeAccountSwitcher:
         write this method exists to never make. The second walk costs one
         process-table read per IDLE profile -- LIVE and UNKNOWN ones take the
         cheap early exit above and never reach the lock -- and it is the price
-        of a correct write.
+        of a correct write. The window the second walk still leaves open is
+        written down once, at the consume gate's own re-probe in
+        ``_consume_backup_grant_locked``.
 
         The store write is deliberately the pure one: ``_post_backup_write``
         would invalidate the very profile just captured, and the two now hold

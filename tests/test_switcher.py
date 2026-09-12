@@ -9905,6 +9905,47 @@ class TestConsumeGate:
         assert result.error == "session-not-idle"
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    def test_gate_refuses_a_session_that_started_during_the_lock_wait(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """Idle before the lock, live once it is held.
+
+        `claude --resume` reuses a valid profile and returns before taking any
+        lock of ours, so it can start while this call waits. On the pre-lock
+        answer alone the gate copied that live profile's credential into the
+        backup and POSTed its grant, and whichever actor refreshed second held
+        a consumed generation. The answer that governs the write is the one
+        taken under the lock.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        sdir = s._session_dir("1", "test@example.com")
+        sdir.mkdir(parents=True)
+        (sdir / ".credentials.json").write_text(self._NEW)
+        (sdir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com"}
+        }))
+        walks = []
+
+        def probe(_dir):
+            # Idle on the pre-lock walk, live on every walk after it.
+            walks.append(_dir)
+            return ([], True) if len(walks) == 1 else ([4242], True)
+
+        monkeypatch.setattr(
+            "claude_swap.process_detection.scan_env_bound_claude", probe
+        )
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        post.assert_not_called()
+        assert result.error == "session-not-idle"
+        assert result.consumed_fp is None
+        # The live profile's credential never reached the backup.
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+        assert len(walks) == 2  # the pre-lock exit, then the decision
+
     def test_gate_rereads_under_lock_and_posts_rereread_bytes(
         self, temp_home: Path, sample_sequence_data: dict
     ):
