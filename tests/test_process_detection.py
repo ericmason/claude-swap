@@ -1088,7 +1088,6 @@ class TestThePrefilterMayOnlyRuleOut:
         "/System/Library/PrivateFrameworks/X.framework/Support/mediaremoted",
         "/bin/zsh",
         "/opt/homebrew/bin/rg",
-        "/Applications/Safari.app/Contents/MacOS/Safari",
     ])
     def test_a_name_it_does_recognise_is_still_ruled_out(self, executable):
         """The prefilter has to keep paying for itself, and these are the
@@ -1096,6 +1095,39 @@ class TestThePrefilterMayOnlyRuleOut:
         from claude_swap.process_detection import _known_not_claude
 
         assert _known_not_claude(executable) is True
+
+    @pytest.mark.parametrize("executable", [
+        "/Library/Acme/assistant",
+        "/Applications/Safari.app/Contents/MacOS/Safari",
+        "/Library/SystemExtensions/x.systemextension/Contents/MacOS/x",
+    ])
+    def test_a_writable_location_is_not_enough_on_its_own(self, executable):
+        """`/Library` and the inside of an app bundle are writable by whoever
+        installed the software there, so a main really can run from one. These
+        are ruled out only after argv has been read and says otherwise."""
+        from claude_swap.process_detection import (
+            _known_not_claude, _unlikely_location,
+        )
+
+        assert _known_not_claude(executable) is False
+        assert _unlikely_location(executable) is True
+
+    @pytest.mark.parametrize("executable", [
+        "/Library/Acme/claude",
+        "/Applications/X.app/Contents/MacOS/node",
+        "/Library/Frameworks/Python.framework/Versions/3.13/Resources/"
+        "Python.app/Contents/MacOS/Python",
+        "/usr/bin/nodejs",
+    ])
+    def test_an_interpreter_or_claude_shape_beats_the_location(self, executable):
+        """A framework Python runs as `Python` with a capital P, and Debian
+        spells node `nodejs`. Either could be hosting the CLI."""
+        from claude_swap.process_detection import (
+            _known_not_claude, _unlikely_location,
+        )
+
+        assert _known_not_claude(executable) is False
+        assert _unlikely_location(executable) is False
 
     @pytest.mark.parametrize("executable", [
         "/usr/bin/claude",
@@ -1457,3 +1489,129 @@ class TestAnotherUsersProcessIsNotThisProfilesSession:
                 "", argv_out="  4242 /opt/tools/assistant\n",
                 comm_out="", pids=(4242,), uid_out=""):
             assert scan_env_bound_claude(d) == ([], False)
+
+
+class TestOwnershipIsTheLastReadingNotTheFirst:
+    """A reading that succeeded outranks the uid; only nothing does not."""
+
+    def test_a_readable_matching_main_is_found_whoever_owns_it(self, tmp_path):
+        """argv and the environment were both read and both name a main, so
+        the answer is settled before ownership is ever a question. Asking
+        about the uid first rejected exactly this process."""
+        d = tmp_path / "1-acct"
+        argv = "  4242 /usr/local/bin/claude --resume x\n"
+        with TestScanEnvBoundClaude()._ps(
+                f"  4242 /usr/local/bin/claude --resume x CLAUDE_CONFIG_DIR={d}\n",
+                argv_out=argv, comm_out="  4242 /usr/local/bin/claude\n",
+                pids=(4242,), uid_out="  4242 0\n"):
+            assert scan_env_bound_claude(d) == ([4242], True)
+
+    def test_a_readable_non_claude_is_unbound_on_that_reading(self, tmp_path):
+        d = tmp_path / "1-acct"
+        argv = "  4242 /bin/zsh -c sleep\n"
+        with TestScanEnvBoundClaude()._ps(
+                f"  4242 /bin/zsh -c sleep CLAUDE_CONFIG_DIR={d}\n",
+                argv_out=argv, comm_out="", pids=(4242,), uid_out="  4242 0\n"):
+            assert scan_env_bound_claude(d) == ([], True)
+
+    def test_an_unreadable_claude_shape_is_never_ruled_out_by_uid(self, tmp_path):
+        """argv says main and the environment is withheld. That is not the
+        daemon case the ownership rule exists for, so it has to defer."""
+        d = tmp_path / "1-acct"
+        argv = "  4242 /usr/local/bin/claude --resume x\n"
+        with TestScanEnvBoundClaude()._ps(
+                "", argv_out=argv, comm_out="", pids=(4242,),
+                uid_out="  4242 0\n"):
+            assert scan_env_bound_claude(d) == ([], False)
+
+    def test_the_structured_path_defers_on_a_claude_shape_too(self, tmp_path):
+        d = tmp_path / "1-acct"
+        with structured(p4242=ProcArgs(["/usr/local/bin/claude", "--resume"], None)):
+            with patch("claude_swap.process_detection._proc_uid", return_value=0):
+                assert scan_env_bound_claude(d) == ([], False)
+
+    def test_the_structured_path_rules_out_another_users_daemon(self, tmp_path):
+        d = tmp_path / "1-acct"
+        with structured(p4242=ProcArgs(["/opt/telegraf/bin/telegraf"], None)):
+            with patch("claude_swap.process_detection._proc_uid", return_value=0):
+                assert scan_env_bound_claude(d) == ([], True)
+
+    def test_a_pid_that_vanished_is_gone_not_unknown(self, tmp_path):
+        """`/proc/<pid>` disappearing between the argv read and the owner read
+        means the process exited, which is settled. Folding that in with an
+        unreadable owner reported a dead pid as something we failed to read."""
+        d = tmp_path / "1-acct"
+        with structured(p4242=ProcArgs(["/opt/tools/assistant"], None)):
+            with patch("claude_swap.process_detection._proc_uid",
+                       side_effect=ProcessLookupError(4242)):
+                assert scan_env_bound_claude(d) == ([], True)
+
+    def test_a_vanished_proc_entry_raises_rather_than_answering_none(self):
+        """`/proc/<pid>` is gone, which says the process exited. Returning
+        None there made a settled answer look like an unreadable one."""
+        from claude_swap import process_detection as pd
+
+        with patch.object(pd.sys, "platform", "linux"), \
+             patch.object(pd.os, "stat", side_effect=FileNotFoundError):
+            with pytest.raises(ProcessLookupError):
+                pd._proc_uid(4242)
+
+    def test_an_unreadable_proc_entry_still_answers_none(self):
+        from claude_swap import process_detection as pd
+
+        with patch.object(pd.sys, "platform", "linux"), \
+             patch.object(pd.os, "stat", side_effect=PermissionError):
+            assert pd._proc_uid(4242) is None
+
+    def test_the_comparison_uses_the_effective_uid(self):
+        """macOS `ps uid=` prints the effective uid, so the real one is the
+        wrong thing to compare against."""
+        import inspect
+        from claude_swap import process_detection as pd
+
+        source = inspect.getsource(pd)
+        assert "os.getuid()" not in source
+        assert "os.geteuid()" in source
+
+
+class TestAWritableLocationIsRuledOutOnlyOnArgv:
+    """`/Library/Acme/assistant` running `claude --resume` is a real main."""
+
+    def _macos(self, executable, argv, env):
+        from claude_swap import process_detection as pd
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(pd, "_candidate_pids",
+                                         return_value=[4242]))
+        stack.enter_context(patch.object(pd, "_exec_path_macos",
+                                         return_value=executable))
+        stack.enter_context(patch.object(pd, "_read_proc_args",
+                                         return_value=ProcArgs(argv, env)))
+        stack.enter_context(patch.object(pd, "is_pid_alive", return_value=True))
+        fake_sys = stack.enter_context(patch.object(pd, "sys"))
+        fake_sys.platform = "darwin"
+        return stack
+
+    def test_a_claude_argv_from_a_library_path_is_a_main(self, tmp_path):
+        """The prefilter short-circuited to unbound on the path alone and
+        never read the argv that says this is a live session."""
+        d = tmp_path / "1-acct"
+        with self._macos("/Library/Acme/assistant",
+                         ["claude", "--resume", "x"],
+                         {"CLAUDE_CONFIG_DIR": str(d)}):
+            assert scan_env_bound_claude(d) == ([4242], True)
+
+    def test_a_bundle_executable_hosting_a_main_is_found(self, tmp_path):
+        d = tmp_path / "1-acct"
+        with self._macos("/Applications/Term.app/Contents/MacOS/Term",
+                         ["/usr/local/bin/claude"],
+                         {"CLAUDE_CONFIG_DIR": str(d)}):
+            assert scan_env_bound_claude(d) == ([4242], True)
+
+    def test_a_library_path_with_an_ordinary_argv_is_still_ruled_out(self, tmp_path):
+        """The location rule still has to pay for itself once argv agrees."""
+        d = tmp_path / "1-acct"
+        with self._macos("/Library/Acme/assistant",
+                         ["/Library/Acme/assistant", "--serve"],
+                         {"CLAUDE_CONFIG_DIR": str(d)}):
+            assert scan_env_bound_claude(d) == ([], True)

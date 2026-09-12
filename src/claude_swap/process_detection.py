@@ -232,8 +232,12 @@ def _bound_text(target: str) -> re.Pattern[str]:
     )
 
 # Runtimes a non-native install can front the CLI with. Matched with a trailing
-# version, because `node22` and `python3.13` are the same programs.
-_INTERPRETER = re.compile(r"^(node|bun|deno|python)[\d.]*$")
+# version, because `node22` and `python3.13` are the same programs. Debian
+# ships node as `nodejs`, and a framework build runs as `Python` with a
+# capital P from inside `Python.app/Contents/MacOS`, so neither the spelling
+# nor the case may decide whether a program can host the CLI.
+_INTERPRETER = re.compile(r"^(nodejs|node|bun|deno|python)[\d.]*$",
+                          re.IGNORECASE)
 
 # The script argument names claude: either a bare `claude` or any path ending
 # `/claude`, in both cases at a token boundary so `claude-helper` misses.
@@ -320,7 +324,10 @@ ARGV_UNKNOWN = "unknown"
 def _interpreter_family(argv0: str) -> str | None:
     """Which flag table applies to this program, or None if it hosts nothing."""
     match = _INTERPRETER.match(os.path.basename(argv0))
-    return match.group(1) if match else None
+    if match is None:
+        return None
+    name = match.group(1).lower()
+    return "node" if name == "nodejs" else name
 
 
 # The native installer runs the CLI from a VERSION-NAMED file — on this
@@ -375,15 +382,23 @@ def _is_claude_binary(executable: str) -> bool:
             or _CLAUDE_VERSIONS.search(executable) is not None)
 
 
-# Places a Claude main cannot be installed in. macOS seals the first four
-# against everything short of a system update, and an application bundle runs
-# a GUI app rather than a CLI. A path under one of these is positively not the
-# CLI and not something hosting it.
+# Directories macOS SEALS. Their contents are cryptographically verified and
+# replaced only by a system update, so nobody can install the CLI into one and
+# no process running from one can be a Claude main. This is the only location
+# rule strong enough to settle a pid without reading its argv.
 _SEALED_DIRS = (
     "/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/usr/bin/", "/bin/",
-    "/usr/share/", "/Library/",
+    "/usr/share/", "/Library/Apple/",
 )
-_BUNDLE_EXECUTABLE = re.compile(r"/[^/]+\.(?:app|framework|bundle|xpc)/Contents/")
+
+# Locations where a Claude main is merely UNLIKELY: third-party software under
+# `/Library`, and the executable inside an application or framework bundle.
+# Anyone can write to these, so `/Library/Acme/assistant` running
+# `claude --resume` is a real shape. A process here is ruled out only once its
+# argv has been read and says it is not a main.
+_THIRD_PARTY_DIRS = ("/Library/",)
+_BUNDLE_EXECUTABLE = re.compile(
+    r"/[^/]+\.(?:app|framework|bundle|xpc|systemextension)/Contents/")
 
 # Programs a claude session starts, or that start beside one, and that are
 # positively not it. They inherit CLAUDE_CONFIG_DIR and can outlive the
@@ -428,19 +443,43 @@ def _known_not_claude(executable: str) -> bool:
     False however sealed the directory, so nothing below can rule out a real
     main by location alone.
     """
-    base = os.path.basename(executable)
-    if (_is_claude_binary(executable)
-            or _INTERPRETER.match(base) is not None
-            or _VERSION_NAME.match(base) is not None
-            or _CLAUDE_PATH_PART.search(os.path.dirname(executable)) is not None):
+    if _could_be_claude(executable):
         return False
+    base = os.path.basename(executable)
     if base in _NOT_CLAUDE_PROGRAMS:
         return True
     if base == "<defunct>":
         return True             # a zombie is not running anything
-    if _BUNDLE_EXECUTABLE.search(executable) is not None:
-        return True
     return executable.startswith(_SEALED_DIRS)
+
+
+def _could_be_claude(executable: str) -> bool:
+    """Whether this executable's NAME leaves it able to be a Claude main.
+
+    True for the CLI itself, a version-named file, anything under a path with
+    a `claude` component, and any interpreter, so none of the location rules
+    below can rule out a real main by where it happens to live.
+    """
+    base = os.path.basename(executable)
+    return (_is_claude_binary(executable)
+            or _INTERPRETER.match(base) is not None
+            or _VERSION_NAME.match(base) is not None
+            or _CLAUDE_PATH_PART.search(os.path.dirname(executable)) is not None)
+
+
+def _unlikely_location(executable: str) -> bool:
+    """Whether this executable sits where a Claude main is improbable.
+
+    Weaker than :func:`_known_not_claude` and never enough on its own. Both
+    `/Library` and the inside of an app bundle are writable by whoever
+    installed the software there, so a main can be running from one. The
+    caller must have read argv and found it not claude-shaped before acting
+    on this.
+    """
+    if _could_be_claude(executable):
+        return False
+    return (executable.startswith(_THIRD_PARTY_DIRS)
+            or _BUNDLE_EXECUTABLE.search(executable) is not None)
 
 
 def _pid_map(argv: tuple[str, ...], label: str) -> dict[int, str] | None:
@@ -894,14 +933,35 @@ def _cannot_host_claude(pid: int) -> bool:
     """
     if sys.platform == "darwin":
         executable = _exec_path_macos(pid)
-        return executable is not None and _known_not_claude(executable)
+        if executable is None:
+            return False
+        if _known_not_claude(executable):
+            return True
+        if not _unlikely_location(executable):
+            return False
+        # Third-party software under `/Library`, or a bundle executable.
+        # Anyone can install there, so the location alone cannot settle it:
+        # `/Library/Acme/assistant` running `claude --resume` is a real main
+        # and ruling it out unread reported its live profile as idle.
+        info = _read_proc_args(pid)
+        if info is None or not info.argv:
+            return False
+        return _classify_argv_tokens(
+            info.argv, lambda: _proc_cwd(pid)) == ARGV_OTHER
     if sys.platform.startswith("linux"):
         try:
             raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
         except OSError:
             return False
         argv = [c.decode("utf-8", "replace") for c in raw.split(b"\0") if c]
-        return bool(argv) and _known_not_claude(argv[0])
+        if not argv:
+            return False
+        if _known_not_claude(argv[0]):
+            return True
+        if not _unlikely_location(argv[0]):
+            return False
+        return _classify_argv_tokens(
+            argv, lambda: _proc_cwd(pid)) == ARGV_OTHER
     return False
 
 
@@ -915,10 +975,22 @@ _MAXPATHLEN = 1024
 
 
 def _proc_uid(pid: int) -> int | None:
-    """The uid owning a process, or None when it cannot be read."""
+    """The EFFECTIVE uid owning a process, or None when it cannot be read.
+
+    Raises ``ProcessLookupError`` when the pid is gone. A vanished process and
+    an unreadable one are different answers: the first is settled, the second
+    is not, and folding them together reported a pid that exited mid-scan as
+    something this probe failed to read.
+
+    macOS has no equivalent read here, so this answers None there and the
+    ownership rule falls to the `ps` probe, which reports the effective uid
+    for every pid in one snapshot.
+    """
     if sys.platform.startswith("linux"):
         try:
             return os.stat(f"/proc/{pid}").st_uid
+        except (FileNotFoundError, ProcessLookupError):
+            raise ProcessLookupError(pid) from None
         except OSError:
             return None
     return None
@@ -1014,7 +1086,9 @@ class _PsFallback:
             return None
         owner = self.uids.get(pid)
         try:
-            return int(owner) == os.getuid()
+            # macOS `ps uid=` prints the EFFECTIVE uid, so compare against the
+            # same thing rather than the real one.
+            return int(owner) == os.geteuid()
         except (TypeError, ValueError):
             return None
 
@@ -1046,6 +1120,27 @@ class _PsFallback:
                                    else self.argvs.get(pid))[0]
         return None
 
+    def _unread(self, pid: int, verdict: str) -> str:
+        """The answer for a pid whose ENVIRONMENT could not be read.
+
+        Ownership is consulted only at this point, never before. A reading
+        that succeeded always outranks it: a process whose argv and
+        environment were read and name a main is a main whoever owns it, and
+        one that was read and names something else is unbound on that reading
+        alone. Asking about the owner first rejected a readable, matching
+        claude argv on the strength of its uid.
+
+        Where nothing could be read, ownership is the last reading left. A
+        `claude` bound to a profile this tool manages runs as this user, and
+        another user's environment is precisely what `ps` will not show, so
+        without this the machine's root-owned daemons deferred forever. A
+        claude-shaped argv is never ruled out this way, and an owner that
+        could not be read rules out nothing.
+        """
+        if verdict != ARGV_CLAUDE and self._is_ours(pid) is False:
+            return _UNBOUND
+        return _UNKNOWN
+
     def verdict(self, pid: int, target: str) -> str:
         """``bound``, ``unbound``, or ``unknown`` for one pid."""
         executable = self._executable(pid)
@@ -1058,12 +1153,6 @@ class _PsFallback:
             # the process table lands here; failing closed on all of it would
             # wedge every profile on a machine with other users.
             return _UNBOUND
-        if self._is_ours(pid) is False:
-            # Someone else's process, so not the session about to have its
-            # credentials rewritten — and the environment `ps` withholds for
-            # exactly these processes is what would otherwise leave every root
-            # daemon on the machine unknown for good.
-            return _UNBOUND
         if argv is None:
             if not is_pid_alive(pid):
                 # It exited between the pid listing and the `ps` snapshot. A
@@ -1071,7 +1160,9 @@ class _PsFallback:
                 # calling it unknown would wedge every profile on this machine
                 # for as long as short-lived processes keep starting.
                 return _UNBOUND
-            return _UNKNOWN         # no trusted reading of this pid at all
+            # Nothing was read. Ownership is the only reading left, and it is
+            # exactly here that it belongs: see `_not_ours` below.
+            return _UNBOUND if self._is_ours(pid) is False else _UNKNOWN
         verdict = _classify_argv(argv, lambda: _proc_cwd(pid))
         if verdict == ARGV_OTHER and executable is not None:
             # `comm` reports the executable as a single field, so it survives
@@ -1092,7 +1183,7 @@ class _PsFallback:
         if self.combined is None or pid not in self.combined:
             # Either a main, or a pid argv could not place; no environment to
             # settle it against either way.
-            return _UNKNOWN
+            return self._unread(pid, verdict)
         _, env = _split_argv_env(
             self.combined[pid],
             None if self.argvs is None else self.argvs.get(pid),
@@ -1101,7 +1192,7 @@ class _PsFallback:
             # argv with no environment after it: macOS withholds the
             # environment of another user's process and of the platform
             # binaries it protects.
-            return _UNKNOWN
+            return self._unread(pid, verdict)
         pairs, ambiguous = _env_pairs(env)
         value = pairs.get("CLAUDE_CONFIG_DIR")
         if ambiguous:
@@ -1150,12 +1241,20 @@ def _scan_pid(pid: int, target: str) -> str:
         # environ, so argv is the only reading available.
         if verdict == ARGV_OTHER and recognised:
             return _UNBOUND
-        owner = _proc_uid(pid)
-        if owner is not None and owner != os.getuid():
-            # Someone else's process. It is not the session this tool is about
-            # to rewrite credentials for, and its environment is exactly what
-            # cannot be read, so deferring on it would defer forever.
-            return _UNBOUND
+        if verdict != ARGV_CLAUDE:
+            # Not claude-shaped, and the environment that would settle it is
+            # withheld. Ownership is the last reading left, and only here: a
+            # `claude` bound to a profile this tool manages runs as this user,
+            # so someone else's process is not the session about to have its
+            # credentials rewritten. Without this the machine's root-owned
+            # daemons, whose environment nothing can read, deferred forever
+            # and no profile was ever quiescent.
+            try:
+                owner = _proc_uid(pid)
+            except ProcessLookupError:
+                return _GONE
+            if owner is not None and owner != os.geteuid():
+                return _UNBOUND
         logger.debug("pid %s could not be settled by argv alone and its "
                      "environment is not readable", pid)
         return _UNKNOWN
