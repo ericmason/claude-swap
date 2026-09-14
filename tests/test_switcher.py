@@ -13225,6 +13225,171 @@ class TestAddRefreshesCredentialsFile:
         )
         assert s._logger.warning.called, "the failure must be reported"
 
+    def test_a_keychain_hiccup_in_the_drift_check_does_not_lose_the_refresh(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """The verdict belongs to the read whose bytes are being stored.
+
+        `_reject_credential_drift_since_verify` re-enters
+        `_read_capture_credentials`, which resets the recorded source first. A
+        Keychain that goes momentarily unreadable there must not erase what the
+        capture itself established -- the add still stores the captured bytes,
+        so the file still has to be caught up to them.
+        """
+        s = self._switcher(monkeypatch)
+        cred, stale_mtime = self._write_stale_file()
+
+        calls = {"n": 0}
+
+        def flaky_get_password(service, account):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return self.CREDS  # the capture: healthy
+            raise KeychainError("locked")  # the drift check's re-read
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky_get_password)
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+
+        s.add_account(slot=3)
+
+        assert calls["n"] > 1, (
+            "premise: the drift check re-reads the capture path, which is what "
+            "resets the recorded source"
+        )
+        assert cred.stat().st_mtime > stale_mtime, (
+            "DEFECT: a momentary Keychain lock during the drift check dropped "
+            "the refresh, leaving running sessions on the old account -- the "
+            "exact bug this change fixes"
+        )
+
+    def test_the_refresh_never_crosses_profiles(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """A capture from another profile must not overwrite the active file.
+
+        With `CLAUDE_SECURESTORAGE_CONFIG_DIR` pointing somewhere else, claude
+        reads that profile's Keychain item while the active store's file
+        backend still follows `CLAUDE_CONFIG_DIR`. Writing the capture into the
+        active profile's file would put one profile's credential under
+        another's.
+        """
+        secure = temp_home / "profileB"
+        secure.mkdir()
+        (secure / ".credentials.json").write_text("SECURE-PROFILE-SEED", encoding="utf-8")
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        s._get_claude_config_path().write_text(
+            json.dumps({"oauthAccount": {
+                "emailAddress": "new@example.com", "accountUuid": "uuid-new"}}),
+            encoding="utf-8",
+        )
+        cred, mtime = self._write_stale_file()
+        self._seed_keychain(monkeypatch, self.CREDS)
+
+        s.add_account(slot=3)
+
+        assert cred.read_text(encoding="utf-8") == self.STALE, (
+            "DEFECT: the active profile's file now holds a credential captured "
+            "from a DIFFERENT profile"
+        )
+        assert cred.stat().st_mtime == mtime
+
+    def test_the_refresh_covers_a_custom_config_dir(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """A profile of one's own gets the same fix as the default profile.
+
+        `CLAUDE_CONFIG_DIR` moves the whole profile — the Keychain item and the
+        file that shadows it — together, so the capture and the active store
+        agree and the refresh applies.
+        """
+        profile = temp_home / "work"
+        profile.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        s._get_claude_config_path().write_text(
+            json.dumps({"oauthAccount": {
+                "emailAddress": "new@example.com", "accountUuid": "uuid-new"}}),
+            encoding="utf-8",
+        )
+        cred, stale_mtime = self._write_stale_file()
+        assert cred.parent == profile  # premise: the profile moved with the var
+        self._seed_keychain(monkeypatch, self.CREDS)
+
+        s.add_account(slot=3)
+
+        assert cred.read_text(encoding="utf-8") == self.CREDS, (
+            "DEFECT: a custom-profile user keeps the stale file the default "
+            "profile no longer gets"
+        )
+        assert cred.stat().st_mtime > stale_mtime
+
+    def test_a_held_credential_lock_warns_and_still_adds(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """The refresh takes Claude Code's credential locks, like every other
+        write of this file — and waiting on them can fail, which the add
+        survives."""
+        from contextlib import contextmanager
+
+        from claude_swap.exceptions import ClaudeCodeLockTimeout
+
+        s = self._switcher(monkeypatch)
+        cred, mtime = self._write_stale_file()
+        self._seed_keychain(monkeypatch, self.CREDS)
+        s._logger = MagicMock()
+
+        @contextmanager
+        def _held(*args, **kwargs):
+            raise ClaudeCodeLockTimeout("held by a live session")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr("claude_swap.switcher.claude_credentials_lock", _held)
+
+        s.add_account(slot=3)
+
+        assert "3" in s._get_sequence_data()["accounts"], (
+            "DEFECT: a lock this write only wants best-effort failed the add"
+        )
+        assert s._logger.warning.called
+        assert cred.stat().st_mtime == mtime
+
+    def test_the_refresh_holds_the_credential_locks(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """`add` never writes the Keychain, so an unlocked write could stamp a
+        generation Claude Code has already rotated past back into the file."""
+        from contextlib import contextmanager
+
+        s = self._switcher(monkeypatch)
+        self._write_stale_file()
+        self._seed_keychain(monkeypatch, self.CREDS)
+        held = []
+
+        @contextmanager
+        def _watch(*args, **kwargs):
+            held.append("in")
+            yield
+            held.append("out")
+
+        monkeypatch.setattr("claude_swap.switcher.claude_credentials_lock", _watch)
+
+        s.add_account(slot=3)
+
+        assert held == ["in", "out"], (
+            "DEFECT: the file was written without Claude Code's credential "
+            "locks, so a concurrent rotation can be clobbered"
+        )
+
     def test_add_from_token_never_touches_the_file(
         self, temp_home: Path, monkeypatch, block_real_keychain,
     ):

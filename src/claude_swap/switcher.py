@@ -3762,7 +3762,9 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
-    def _refresh_captured_credentials_shadow(self, credentials: str) -> None:
+    def _refresh_captured_credentials_shadow(
+        self, credentials: str, shadow: Path | None
+    ) -> None:
         """Bump the captured Keychain item's shadow file after a successful add.
 
         ``switch`` already does this on every Keychain write
@@ -3774,18 +3776,47 @@ class ClaudeAccountSwitcher:
         which writes the Keychain alone, then run ``cswap add`` — and left the
         file on its old mtime *and* its old account.
 
-        Runs only when the capture came from the Keychain
-        (``_capture_keychain_shadow``) and that Keychain item's shadow is the
-        active profile's file, so the write stays inside the profile the
-        credential was read from. Rewrite-when-present / never-create, exactly
-        like switch: a Keychain-only user keeps their fileless posture. The add
-        has already succeeded when this runs, so a failure is a warning, never
-        a failed add. The Keychain itself is never written.
+        ``shadow`` is the caller's snapshot of ``_capture_keychain_shadow``,
+        taken at the capture itself and PASSED IN rather than re-read here. The
+        guards between the capture and this call re-enter
+        ``_read_capture_credentials`` (``_reject_credential_drift_since_verify``),
+        which clears that field first — so a Keychain that goes momentarily
+        unreadable during the drift check erased the verdict recorded by the
+        read whose bytes are being stored, and the add completed without the
+        refresh. The credential travels the same way, by argument, so the file
+        can only ever receive the bytes this add captured and stored.
+
+        Runs only when the capture came from the Keychain and that Keychain
+        item's shadow is the active profile's file, so the write stays inside
+        the profile the credential was read from. Rewrite-when-present /
+        never-create, exactly like switch: a Keychain-only user keeps their
+        fileless posture. The Keychain itself is never written.
+
+        Holds Claude Code's credential locks for the write, like every other
+        write of this file in this codebase (``_perform_switch``, the consume
+        gate). ``switch`` loses nothing by holding them and ``add`` cannot skip
+        them: switch replays the bytes it just wrote to the Keychain, so its
+        file can never disagree with the Keychain, while add never writes the
+        Keychain at all — an unlocked write racing Claude Code's own rotation
+        would stamp the superseded generation back into the file with a fresh
+        mtime.
+
+        The add has already succeeded when this runs, so every failure here —
+        a lock that stays held, a denied write — is a warning rather than a
+        failed add. The cost of one is that a running session may not
+        hot-reload until it restarts.
         """
-        shadow = self._capture_keychain_shadow
         if shadow is None or not _same_directory(shadow.parent, get_credentials_path().parent):
             return
-        self._refresh_stale_credentials_file(credentials)
+        try:
+            with claude_credentials_lock():
+                self._refresh_stale_credentials_file(credentials)
+        except Exception as e:
+            self._logger.warning(
+                f"Could not take Claude Code's credential locks to refresh "
+                f".credentials.json after the add ({e}); a running session may "
+                "not hot-reload until restart"
+            )
 
     def add_account(
         self,
@@ -3839,6 +3870,10 @@ class ClaudeAccountSwitcher:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
+            # THIS read's verdict, snapshotted before the guards below re-enter
+            # the capture path and reset it. See
+            # ``_refresh_captured_credentials_shadow``.
+            captured_shadow = self._capture_keychain_shadow
             self._reject_live_api_key_capture(current_creds)
             current_creds = self._reject_foreign_credential_capture(
                 current_creds, current_email, current_org_uuid,
@@ -3879,7 +3914,7 @@ class ClaudeAccountSwitcher:
             seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
-            self._refresh_captured_credentials_shadow(current_creds)
+            self._refresh_captured_credentials_shadow(current_creds, captured_shadow)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3967,6 +4002,10 @@ class ClaudeAccountSwitcher:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
+        # THIS read's verdict, snapshotted before the guards below re-enter the
+        # capture path and reset it. See
+        # ``_refresh_captured_credentials_shadow``.
+        captured_shadow = self._capture_keychain_shadow
         self._reject_live_api_key_capture(current_creds)
         current_creds = self._reject_foreign_credential_capture(
             current_creds, current_email, current_org_uuid, current_account_uuid
@@ -4036,7 +4075,7 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        self._refresh_captured_credentials_shadow(current_creds)
+        self._refresh_captured_credentials_shadow(current_creds, captured_shadow)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
