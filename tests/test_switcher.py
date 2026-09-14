@@ -13182,18 +13182,94 @@ class TestAddRefreshesCredentialsFile:
             "Keychain-only user"
         )
 
+    def test_a_rotation_after_the_capture_is_not_stamped_back(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """The captured bytes are old by the time the add finishes.
+
+        They are read before the identity fetch, the drift re-read and the
+        backup writes. A Claude Code refresh landing in that gap retires the
+        captured grant server-side, so writing it now would hot-reload a
+        running session onto a dead token whose next refresh fails with
+        `invalid_grant`.
+        """
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-ROTATED", "refreshToken": "rt-rotated",
+            "expiresAt": 99999999999000}})
+        s = self._switcher(monkeypatch)
+        cred, mtime = self._write_stale_file()
+
+        seen = {"n": 0}
+
+        def rotating_get_password(service, account):
+            seen["n"] += 1
+            # The capture and the drift re-read see the captured generation;
+            # Claude Code rotates before the locked write re-reads.
+            return self.CREDS if seen["n"] <= 2 else rotated
+
+        monkeypatch.setattr(macos_keychain, "get_password", rotating_get_password)
+
+        s.add_account(slot=3)
+
+        assert cred.read_text(encoding="utf-8") == self.STALE, (
+            "DEFECT: a generation the server has already retired was stamped "
+            "into the file, and a running session will hot-reload onto it"
+        )
+        assert cred.stat().st_mtime == mtime
+        assert "3" in s._get_sequence_data()["accounts"], (
+            "the add itself still succeeds; only the refresh is skipped"
+        )
+
+    def test_an_access_token_rotation_still_refreshes(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """CONTROL: the re-check is on LINEAGE, not on bytes.
+
+        `credential_fingerprint` hashes the refresh token, so an
+        access-token-only rotation is the same grant and must still refresh --
+        otherwise the re-check would swallow the ordinary case.
+        """
+        same_lineage = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-NEWER", "refreshToken": "rt-new",
+            "expiresAt": 99999999999000}})
+        s = self._switcher(monkeypatch)
+        cred, stale_mtime = self._write_stale_file()
+
+        seen = {"n": 0}
+
+        def rotating_get_password(service, account):
+            seen["n"] += 1
+            return self.CREDS if seen["n"] <= 2 else same_lineage
+
+        monkeypatch.setattr(macos_keychain, "get_password", rotating_get_password)
+
+        s.add_account(slot=3)
+
+        assert cred.stat().st_mtime > stale_mtime, (
+            "DEFECT: the lineage re-check refused an access-token rotation of "
+            "the SAME grant, which is the common case"
+        )
+
     def test_file_backed_add_leaves_the_file_alone(
         self, temp_home: Path, monkeypatch, block_real_keychain,
     ):
         """No Keychain (Linux/WSL/Windows): the file IS the capture's source.
 
         It already holds what Claude Code serves, so rewriting it would bump
-        an mtime for nothing.
+        an mtime for nothing. The Keychain here holds a DIFFERENT credential,
+        so a capture that consulted it anyway would rewrite the file and this
+        test would catch it.
         """
         s = self._switcher(monkeypatch, platform=Platform.LINUX)
-        cred, mtime = self._write_stale_file(self.CREDS)
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+        self._seed_keychain(monkeypatch, self.CREDS)
+        cred, mtime = self._write_stale_file(self.STALE)
 
         s.add_account(slot=3)
+
+        assert cred.read_text(encoding="utf-8") == self.STALE, (
+            "DEFECT: a platform with no Keychain captured one anyway"
+        )
 
         assert cred.stat().st_mtime == mtime, (
             "DEFECT: a file-backed add rewrote the very file it read, "

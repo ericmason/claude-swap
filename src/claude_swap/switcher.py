@@ -385,11 +385,17 @@ class ClaudeAccountSwitcher:
         # re-asked rather than replayed.
         self._oracle_identity_cache: tuple[str, dict] | None = None
         # The plaintext ``.credentials.json`` that shadows the Keychain item
-        # the LAST capture read came from, or None when that read did not come
-        # from a Keychain at all. ``add_account`` uses it to bump a stale
-        # shadow's mtime the way ``switch`` does (#86); None (the default, and
-        # what every non-capture path leaves it as) means "nothing to refresh".
-        self._capture_keychain_shadow: Path | None = None
+        # THIS THREAD's last capture read came from, or None when that read did
+        # not come from a Keychain at all. ``add_account`` uses it to bump a
+        # stale shadow's mtime the way ``switch`` does (#86); None (the
+        # default, and what every non-capture path leaves it as) means
+        # "nothing to refresh".
+        #
+        # Thread-local for the same reason as ``_active_verdict_tls`` above: it
+        # is a fact about one READ, and the TUI runs two lanes on one switcher,
+        # so a concurrent capture's reset would otherwise erase this lane's
+        # verdict.
+        self._capture_shadow_tls = threading.local()
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
@@ -663,6 +669,14 @@ class ClaudeAccountSwitcher:
     @_keychain_disabled_until.setter
     def _keychain_disabled_until(self, value: float) -> None:
         self._store._keychain_disabled_until = value
+
+    @property
+    def _capture_keychain_shadow(self) -> Path | None:
+        return getattr(self._capture_shadow_tls, "value", None)
+
+    @_capture_keychain_shadow.setter
+    def _capture_keychain_shadow(self, value: Path | None) -> None:
+        self._capture_shadow_tls.value = value
 
     @property
     def _last_active_credentials_backend(self) -> str | None:
@@ -3801,6 +3815,9 @@ class ClaudeAccountSwitcher:
         would stamp the superseded generation back into the file with a fresh
         mtime.
 
+        Under that lock it re-reads the live credential and refreshes only
+        while the capture's lineage is still the one Claude Code serves.
+
         The add has already succeeded when this runs, so every failure here —
         a lock that stays held, a denied write — is a warning rather than a
         failed add. The cost of one is that a running session may not
@@ -3810,6 +3827,35 @@ class ClaudeAccountSwitcher:
             return
         try:
             with claude_credentials_lock():
+                # LINEAGE RE-CHECK UNDER THE LOCK, the same shape
+                # ``_perform_switch`` uses before it writes. These bytes were
+                # captured before the identity fetch, the drift re-read and
+                # the backup writes; a Claude Code rotation landing in that
+                # gap means writing them now hands a running session a
+                # retired grant, whose next refresh fails with
+                # ``invalid_grant``. The fingerprint is lineage identity —
+                # it hashes the refresh token, so an access-token-only
+                # rotation compares equal and still refreshes.
+                #
+                # Unreadable is UNVERIFIABLE, not a refusal, exactly as
+                # ``_reject_credential_drift_since_verify`` treats it: a
+                # Keychain that went momentarily unreadable says nothing
+                # about whether the lineage moved, and refusing on it drops
+                # the refresh for the ordinary case this change exists to
+                # fix. Only a READABLE credential on a different lineage
+                # skips the write.
+                try:
+                    live = self._read_capture_credentials()
+                except Exception:  # noqa: BLE001 — unreadable is unverifiable
+                    live = None
+                after = oauth.credential_fingerprint(live) if live else None
+                if after is not None and after != oauth.credential_fingerprint(credentials):
+                    self._logger.info(
+                        "Left .credentials.json alone: the live credential "
+                        "moved on between the capture and the write, so the "
+                        "captured bytes are no longer what Claude Code serves"
+                    )
+                    return
                 self._refresh_stale_credentials_file(credentials)
         except Exception as e:
             self._logger.warning(
