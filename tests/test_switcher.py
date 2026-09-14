@@ -13086,3 +13086,157 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestAddRefreshesCredentialsFile:
+    """``cswap add`` must bump a stale ``.credentials.json`` the way switch does.
+
+    MEASURED IN THE FIELD (2026-09-14): you ``/login`` in Claude Code as a new
+    account — which on macOS writes the Keychain only — and then run
+    ``cswap add``. The plaintext file kept its old mtime AND its old account, so
+    every session started before the login went on serving the previous
+    account's memoized token until it restarted, while sessions started after
+    it came up on the new one. ``_write_oauth_credentials`` (switch) already
+    rewrites a present file after every Keychain write for exactly this
+    reason (#86); add did not.
+    """
+
+    CREDS = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-NEW", "refreshToken": "rt-new",
+        "expiresAt": 99999999999000}})
+    STALE = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-OLD", "refreshToken": "rt-old",
+        "expiresAt": 99999999999000}})
+
+    def _switcher(self, monkeypatch, platform=Platform.MACOS):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        s = ClaudeAccountSwitcher()
+        s.platform = platform
+        s._setup_directories()
+        s._init_sequence_file()
+        s._get_claude_config_path().write_text(
+            json.dumps({"oauthAccount": {
+                "emailAddress": "new@example.com",
+                "accountUuid": "uuid-new",
+            }}),
+            encoding="utf-8",
+        )
+        return s
+
+    def _seed_keychain(self, monkeypatch, value):
+        monkeypatch.setattr(
+            macos_keychain, "get_password", lambda service, account: value
+        )
+
+    def _write_stale_file(self, text=None):
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text(self.STALE if text is None else text, encoding="utf-8")
+        old = time.time() - 10_000
+        os.utime(cred, (old, old))
+        return cred, cred.stat().st_mtime
+
+    def test_keychain_add_rewrites_a_stale_credentials_file(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """The file ends up holding the captured credential, with a new mtime.
+
+        The mtime is the whole point: Claude Code drops its memoized OAuth
+        token only when this file's mtime changes, so a running session
+        hot-reloads instead of serving the previous account until restart.
+        """
+        s = self._switcher(monkeypatch)
+        cred, stale_mtime = self._write_stale_file()
+        self._seed_keychain(monkeypatch, self.CREDS)
+
+        s.add_account(slot=3)
+
+        assert cred.read_text(encoding="utf-8") == self.CREDS, (
+            "DEFECT: the file still holds the PREVIOUS account after an add "
+            "that captured a different one from the Keychain"
+        )
+        assert cred.stat().st_mtime > stale_mtime, (
+            "DEFECT: the mtime did not move, so a running session keeps "
+            "serving its memoized token for the old account"
+        )
+
+    def test_keychain_add_does_not_create_an_absent_credentials_file(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """Keychain-only users keep their fileless posture.
+
+        Their absent-file path already hot-reloads through Claude Code's ~30s
+        Keychain TTL, so creating one would only put a plaintext credential on
+        disk that was never there.
+        """
+        s = self._switcher(monkeypatch)
+        cred = get_credentials_path()
+        assert not cred.exists()  # premise
+        self._seed_keychain(monkeypatch, self.CREDS)
+
+        s.add_account(slot=3)
+
+        assert not cred.exists(), (
+            "DEFECT: add created a plaintext credentials file for a "
+            "Keychain-only user"
+        )
+
+    def test_file_backed_add_leaves_the_file_alone(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """No Keychain (Linux/WSL/Windows): the file IS the capture's source.
+
+        It already holds what Claude Code serves, so rewriting it would bump
+        an mtime for nothing.
+        """
+        s = self._switcher(monkeypatch, platform=Platform.LINUX)
+        cred, mtime = self._write_stale_file(self.CREDS)
+
+        s.add_account(slot=3)
+
+        assert cred.stat().st_mtime == mtime, (
+            "DEFECT: a file-backed add rewrote the very file it read, "
+            "invalidating every running session's token for no reason"
+        )
+
+    def test_a_failed_rewrite_warns_and_still_adds(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """Best-effort: the backups and sequence.json are already written.
+
+        A read-only file or a denied write means a running session may lag
+        until restart — it must never cost the user the add.
+        """
+        s = self._switcher(monkeypatch)
+        self._write_stale_file()
+        self._seed_keychain(monkeypatch, self.CREDS)
+        s._logger = MagicMock()
+
+        def _denied(credentials):
+            raise PermissionError("read-only file")
+
+        monkeypatch.setattr(s._store, "_write_active_credentials_file", _denied)
+
+        s.add_account(slot=3)
+
+        assert "3" in s._get_sequence_data()["accounts"], (
+            "DEFECT: a best-effort file refresh failed the whole add"
+        )
+        assert s._logger.warning.called, "the failure must be reported"
+
+    def test_add_from_token_never_touches_the_file(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+    ):
+        """``add --token`` registers a token it was handed, not the live login.
+
+        It captures nothing from the Keychain and activates nothing, so the
+        active credential — and the file that shadows it — is still current.
+        """
+        s = self._switcher(monkeypatch)
+        cred, mtime = self._write_stale_file()
+
+        s.add_account_from_token("sk-ant-oat01-HANDED-OVER", slot=4)
+
+        assert cred.stat().st_mtime == mtime
+        assert cred.read_text(encoding="utf-8") == self.STALE

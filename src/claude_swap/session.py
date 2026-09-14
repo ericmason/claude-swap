@@ -382,6 +382,45 @@ def _keychain_entry(service: str, strict: bool) -> str | None:
             time.sleep(_STRICT_KEYCHAIN_RETRY_DELAY)
 
 
+def read_config_dir_credentials_with_source(
+    config_dir: str,
+    *,
+    strict_keychain: bool = False,
+    keychain_service: str | None = None,
+) -> tuple[str | None, bool]:
+    """:func:`read_config_dir_credentials`, plus where the bytes came from.
+
+    Returns ``(credentials, from_keychain)``. ``from_keychain`` is True only
+    when the keychain answered — the one case where the profile's plaintext
+    ``.credentials.json`` may be a *stale shadow* of what claude now serves.
+    A capture that came from the file itself is already current, so nothing
+    needs rewriting. ``add_account`` is the caller that cares (#86).
+    """
+    directory = Path(config_dir)
+    if not directory.is_dir():
+        return None, False
+    if Platform.detect() == Platform.MACOS:
+        for service in _keychain_services(config_dir, keychain_service):
+            try:
+                creds = _keychain_entry(service, strict_keychain)
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                if strict_keychain:
+                    raise CredentialReadError(
+                        f"Keychain entry for profile {config_dir} is unreadable "
+                        f"(locked or busy) — unlock the keychain and retry: {e}"
+                    ) from e
+                break  # best-effort read: the plaintext seed is the next-best truth
+            if creds:
+                return creds, True
+            # entry absent (rc 44) — claude's own signal to look further
+    try:
+        return (directory / ".credentials.json").read_text(encoding="utf-8"), False
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
+        # readable credential material", not an error to propagate.
+        return None, False
+
+
 def read_config_dir_credentials(
     config_dir: str,
     *,
@@ -407,30 +446,15 @@ def read_config_dir_credentials(
     one account's email against another's token — the very mismatch the capture
     path exists to prevent. An *absent* entry (rc 44) still falls back either
     way: absence is claude's own signal to read the file.
+
+    Thin wrapper over :func:`read_config_dir_credentials_with_source` for the
+    callers that only need the bytes.
     """
-    directory = Path(config_dir)
-    if not directory.is_dir():
-        return None
-    if Platform.detect() == Platform.MACOS:
-        for service in _keychain_services(config_dir, keychain_service):
-            try:
-                creds = _keychain_entry(service, strict_keychain)
-            except macos_keychain.KEYCHAIN_ERRORS as e:
-                if strict_keychain:
-                    raise CredentialReadError(
-                        f"Keychain entry for profile {config_dir} is unreadable "
-                        f"(locked or busy) — unlock the keychain and retry: {e}"
-                    ) from e
-                break  # best-effort read: the plaintext seed is the next-best truth
-            if creds:
-                return creds
-            # entry absent (rc 44) — claude's own signal to look further
-    try:
-        return (directory / ".credentials.json").read_text(encoding="utf-8")
-    except (OSError, ValueError):
-        # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
-        # readable credential material", not an error to propagate.
-        return None
+    return read_config_dir_credentials_with_source(
+        config_dir,
+        strict_keychain=strict_keychain,
+        keychain_service=keychain_service,
+    )[0]
 
 
 def read_session_identity(session_dir: Path) -> tuple[str, str] | None:

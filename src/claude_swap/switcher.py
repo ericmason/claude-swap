@@ -384,6 +384,12 @@ class ClaudeAccountSwitcher:
         # complete enough to place a slot is cached, so a partial answer is
         # re-asked rather than replayed.
         self._oracle_identity_cache: tuple[str, dict] | None = None
+        # The plaintext ``.credentials.json`` that shadows the Keychain item
+        # the LAST capture read came from, or None when that read did not come
+        # from a Keychain at all. ``add_account`` uses it to bump a stale
+        # shadow's mtime the way ``switch`` does (#86); None (the default, and
+        # what every non-capture path leaves it as) means "nothing to refresh".
+        self._capture_keychain_shadow: Path | None = None
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
@@ -675,6 +681,9 @@ class ClaudeAccountSwitcher:
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
 
+    def _refresh_stale_credentials_file(self, credentials: str) -> None:
+        self._store._refresh_stale_credentials_file(credentials)
+
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
 
@@ -701,6 +710,9 @@ class ClaudeAccountSwitcher:
         anyway, which is precisely the outcome this guard exists to prevent.
         """
         active = self._read_active_credentials()
+        if active.from_keychain:
+            # The active store's own shadow file is the one that can lag.
+            self._capture_keychain_shadow = get_credentials_path()
         if active.degraded:
             raise CredentialReadError(
                 "The macOS Keychain is unreadable right now (locked or no GUI "
@@ -745,9 +757,15 @@ class ClaudeAccountSwitcher:
 
         Read-only. cswap does not write claude's hashed keychain entry — see
         the ``session`` module docstring for why.
-        """
-        from claude_swap.session import read_config_dir_credentials
 
+        Records ``_capture_keychain_shadow``: the plaintext ``.credentials.json``
+        that shadows the Keychain item these bytes came from, or None when the
+        bytes came from a file (or from ``primaryApiKey``). ``add_account``
+        refreshes that shadow's mtime the way ``switch`` does (#86).
+        """
+        from claude_swap.session import read_config_dir_credentials_with_source
+
+        self._capture_keychain_shadow = None
         secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
         config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
 
@@ -759,12 +777,15 @@ class ClaudeAccountSwitcher:
             # into the active store: its file backend follows
             # ``CLAUDE_CONFIG_DIR``, and with the two vars diverged that would
             # capture a profile claude is not reading (cross-profile leak).
-            creds = read_config_dir_credentials(
-                secure_env or str(get_default_claude_config_home()),
+            secure_dir = secure_env or str(get_default_claude_config_home())
+            creds, from_keychain = read_config_dir_credentials_with_source(
+                secure_dir,
                 strict_keychain=True,
                 keychain_service=CLAUDE_CODE_KEYCHAIN_SERVICE if not secure_env else None,
             )
             if creds:
+                if from_keychain:
+                    self._capture_keychain_shadow = Path(secure_dir) / ".credentials.json"
                 return creds
             # The tail below is not a continuation of this branch: it reads
             # ``primaryApiKey`` through ``get_global_config_path()``, which
@@ -777,8 +798,12 @@ class ClaudeAccountSwitcher:
         elif not config_dir:
             return self._refuse_degraded_capture()
         else:
-            creds = read_config_dir_credentials(config_dir, strict_keychain=True)
+            creds, from_keychain = read_config_dir_credentials_with_source(
+                config_dir, strict_keychain=True
+            )
             if creds:
+                if from_keychain:
+                    self._capture_keychain_shadow = Path(config_dir) / ".credentials.json"
                 return creds
             if _same_directory(Path(config_dir), get_default_claude_config_home()):
                 # Safe only on this legacy path: the active store's env-following
@@ -3737,6 +3762,31 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    def _refresh_captured_credentials_shadow(self, credentials: str) -> None:
+        """Bump the captured Keychain item's shadow file after a successful add.
+
+        ``switch`` already does this on every Keychain write
+        (``_write_oauth_credentials`` → ``_refresh_stale_credentials_file``):
+        Claude Code drops its memoized OAuth token only when
+        ``.credentials.json`` changes mtime, so a running session otherwise
+        serves the previous account until it restarts (#86). ``add`` reaches the
+        same state by a different route — you ``/login`` as the new account,
+        which writes the Keychain alone, then run ``cswap add`` — and left the
+        file on its old mtime *and* its old account.
+
+        Runs only when the capture came from the Keychain
+        (``_capture_keychain_shadow``) and that Keychain item's shadow is the
+        active profile's file, so the write stays inside the profile the
+        credential was read from. Rewrite-when-present / never-create, exactly
+        like switch: a Keychain-only user keeps their fileless posture. The add
+        has already succeeded when this runs, so a failure is a warning, never
+        a failed add. The Keychain itself is never written.
+        """
+        shadow = self._capture_keychain_shadow
+        if shadow is None or not _same_directory(shadow.parent, get_credentials_path().parent):
+            return
+        self._refresh_stale_credentials_file(credentials)
+
     def add_account(
         self,
         slot: int | None = None,
@@ -3829,6 +3879,7 @@ class ClaudeAccountSwitcher:
             seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
+            self._refresh_captured_credentials_shadow(current_creds)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3985,6 +4036,7 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        self._refresh_captured_credentials_shadow(current_creds)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:

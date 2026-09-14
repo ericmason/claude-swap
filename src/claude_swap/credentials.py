@@ -156,11 +156,15 @@ class ActiveCredentials(NamedTuple):
     A degraded credential may be adopted or served, but its refresh token
     must never be consumed — POSTing a superseded one-time rt yields
     invalid_grant and a false dead-token strike on a live account.
+    ``from_keychain`` is True only when the Keychain itself served the bytes,
+    which is the one case where ``.credentials.json`` may be a stale shadow of
+    what Claude Code now serves — see ``_refresh_stale_credentials_file`` (#86).
     """
 
     value: str | None
     keychain_unavailable: bool
     degraded: bool = False
+    from_keychain: bool = False
 
 
 def looks_like_api_key(credentials: str | None) -> bool:
@@ -610,7 +614,7 @@ class CredentialStore:
             # which is what makes it self-heal without being erasable.
             self._active_read_failed = keychain_failed
             if val:
-                return ActiveCredentials(val, False)
+                return ActiveCredentials(val, False, False, True)
         elif self._residual_verdict is False or (
             self._active_read_failed or self._keychain_unreadable
         ):
