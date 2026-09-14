@@ -3827,23 +3827,29 @@ class ClaudeAccountSwitcher:
             return
         try:
             with claude_credentials_lock():
-                # LINEAGE RE-CHECK UNDER THE LOCK, the same shape
-                # ``_perform_switch`` uses before it writes. These bytes were
-                # captured before the identity fetch, the drift re-read and
-                # the backup writes; a Claude Code rotation landing in that
-                # gap means writing them now hands a running session a
-                # retired grant, whose next refresh fails with
-                # ``invalid_grant``. The fingerprint is lineage identity —
-                # it hashes the refresh token, so an access-token-only
-                # rotation compares equal and still refreshes.
+                # LINEAGE RE-CHECK UNDER THE LOCK, the same question
+                # ``_perform_switch`` asks before it writes — with the
+                # opposite answer for an UNREADABLE store, deliberately.
+                # That path refuses on one because it is activating another
+                # account and a store it cannot read may not be the account
+                # it checked. This one is writing back the bytes the add just
+                # captured and stored, and refusing on an unreadable Keychain
+                # would drop the refresh for the ordinary case this whole
+                # change exists to fix. It can also afford to: a rotation
+                # still in flight is blocked by the lock we hold, and one
+                # that already finished leaves a READABLE Keychain the
+                # re-check below catches. ``_reject_credential_drift_since_
+                # verify`` treats an unreadable store the same way, for the
+                # same reason: unreadable is UNVERIFIABLE, not a refusal.
                 #
-                # Unreadable is UNVERIFIABLE, not a refusal, exactly as
-                # ``_reject_credential_drift_since_verify`` treats it: a
-                # Keychain that went momentarily unreadable says nothing
-                # about whether the lineage moved, and refusing on it drops
-                # the refresh for the ordinary case this change exists to
-                # fix. Only a READABLE credential on a different lineage
-                # skips the write.
+                # These bytes were captured before the identity fetch, the
+                # drift re-read and the backup writes; a Claude Code rotation
+                # landing in that gap means writing them now hands a running
+                # session a retired grant, whose next refresh fails with
+                # ``invalid_grant``. The fingerprint is lineage identity — it
+                # hashes the refresh token, so an access-token-only rotation
+                # compares equal and still refreshes. Only a READABLE
+                # credential on a different lineage skips the write.
                 try:
                     live = self._read_capture_credentials()
                 except Exception:  # noqa: BLE001 — unreadable is unverifiable

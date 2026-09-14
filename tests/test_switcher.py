@@ -13108,6 +13108,25 @@ class TestAddRefreshesCredentialsFile:
         "accessToken": "sk-ant-oat01-OLD", "refreshToken": "rt-old",
         "expiresAt": 99999999999000}})
 
+    @pytest.fixture(autouse=True)
+    def _no_real_credential_locks(self, monkeypatch):
+        """Stub Claude Code's credential locks for every test in this class.
+
+        The real ones spawn a mtime toucher thread per lock and join it with a
+        1s timeout, so a thread can outlive its own test's teardown and write
+        through an unpatched ``$HOME`` -- which is what `RealStoreWriteBlocked`
+        exists to stop, and which showed up here as unrelated tests failing at
+        random in the same xdist worker. The two tests that are ABOUT the lock
+        install their own double over this one.
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _noop(*args, **kwargs):
+            yield
+
+        monkeypatch.setattr("claude_swap.switcher.claude_credentials_lock", _noop)
+
     def _switcher(self, monkeypatch, platform=Platform.MACOS):
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
@@ -13200,8 +13219,14 @@ class TestAddRefreshesCredentialsFile:
         cred, mtime = self._write_stale_file()
 
         seen = {"n": 0}
+        backup_store = macos_keychain.get_password  # the fixture's in-memory fake
 
         def rotating_get_password(service, account):
+            # Only the ACTIVE OAuth item rotates. The per-account backup item
+            # is a different service and answers normally, so it neither
+            # rotates nor counts.
+            if service != CLAUDE_CODE_KEYCHAIN_SERVICE:
+                return backup_store(service, account)
             seen["n"] += 1
             # The capture and the drift re-read see the captured generation;
             # Claude Code rotates before the locked write re-reads.
@@ -13211,6 +13236,12 @@ class TestAddRefreshesCredentialsFile:
 
         s.add_account(slot=3)
 
+        assert seen["n"] == 3, (
+            "premise: the capture, the drift re-read, and the re-check under "
+            "the lock are three reads of the ACTIVE item, in that order -- a "
+            "different count means the rotation landed somewhere this test "
+            f"did not intend, not that the code is right (got {seen['n']})"
+        )
         assert cred.read_text(encoding="utf-8") == self.STALE, (
             "DEFECT: a generation the server has already retired was stamped "
             "into the file, and a running session will hot-reload onto it"
@@ -13236,8 +13267,11 @@ class TestAddRefreshesCredentialsFile:
         cred, stale_mtime = self._write_stale_file()
 
         seen = {"n": 0}
+        backup_store = macos_keychain.get_password  # the fixture's in-memory fake
 
         def rotating_get_password(service, account):
+            if service != CLAUDE_CODE_KEYCHAIN_SERVICE:
+                return backup_store(service, account)
             seen["n"] += 1
             return self.CREDS if seen["n"] <= 2 else same_lineage
 
@@ -13245,6 +13279,12 @@ class TestAddRefreshesCredentialsFile:
 
         s.add_account(slot=3)
 
+        assert seen["n"] == 3, (
+            "premise: the capture, the drift re-read, and the re-check under "
+            "the lock are three reads of the ACTIVE item, in that order -- a "
+            "different count means the rotation landed somewhere this test "
+            f"did not intend, not that the code is right (got {seen['n']})"
+        )
         assert cred.stat().st_mtime > stale_mtime, (
             "DEFECT: the lineage re-check refused an access-token rotation of "
             "the SAME grant, which is the common case"
