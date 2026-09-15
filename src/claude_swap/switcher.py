@@ -266,8 +266,12 @@ def stale_error_note(entry: UsageEntry) -> str | None:
     so without this note a 429'd account looks current. Public: the CLI and
     the TUI both render it so the two surfaces agree.
     """
+    if entry.sentinel is not None:
+        return None  # the sentinel line already explains the state
     if entry.last_good is None or not entry.last_error:
         return None
+    if entry.age_s is None or entry.age_s < _USAGE_AGE_NOTE_S:
+        return None  # numbers are within the serve TTL: fresh enough
     return f"stale: {STALE_ERROR_NOTES.get(entry.last_error, entry.last_error)}"
 
 

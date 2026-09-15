@@ -361,14 +361,26 @@ class TestFormatting:
         cli = "\n".join(_usage_entry_lines(entry))
         assert "stale: rate limited" in cli
 
-        # A fresh failure inside the serve TTL still gets the note.
+        # A failure while the numbers are still inside the serve TTL is not
+        # stale: no note, same threshold as the "· Nm ago" label.
         fresh_fail = dataclasses.replace(make_entry(age_s=5.0), last_error="timeout")
+        assert stale_error_note(fresh_fail) is None
+        assert "stale" not in account_card_text(make_account(2, entry=fresh_fail), 100).plain
+        aged_fail = dataclasses.replace(make_entry(age_s=400.0), last_error="timeout")
         assert "stale: endpoint timed out" in account_card_text(
-            make_account(2, entry=fresh_fail), 100
+            make_account(2, entry=aged_fail), 100
         ).plain
 
+        # A sentinel overlay already explains the state — never a second ⚠.
+        under_sentinel = dataclasses.replace(entry, sentinel=USAGE_TOKEN_EXPIRED)
+        assert stale_error_note(under_sentinel) is None
+        sentinel_card = account_card_text(make_account(2, entry=under_sentinel), 100).plain
+        assert sentinel_card.count("⚠") == 1
+        assert "stale:" not in sentinel_card
+        assert "stale:" not in "\n".join(_usage_entry_lines(under_sentinel))
+
         # Unknown kinds render raw; a clean entry gets no note at all.
-        odd = dataclasses.replace(make_entry(), last_error="http-503")
+        odd = dataclasses.replace(make_entry(age_s=400.0), last_error="http-503")
         assert stale_error_note(odd) == "stale: http-503"
         assert stale_error_note(make_entry()) is None
         assert "stale" not in account_card_text(make_account(2, entry=make_entry()), 100).plain
