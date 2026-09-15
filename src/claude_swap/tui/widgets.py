@@ -17,7 +17,7 @@ from textual.widgets import ListItem, Static
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
-from claude_swap.switcher import ERROR_NOTES
+from claude_swap.switcher import ERROR_NOTES, stale_error_note
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -186,6 +186,11 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
+    stale = stale_error_note(acc.usage)
+    if stale is not None:
+        # Stale-on-error keeps the last good bars below; say so up here or
+        # a rate-limited account reads as current.
+        text.append(f"   ⚠ {stale}", style=palette.sev_warn)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:

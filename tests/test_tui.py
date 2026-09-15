@@ -343,6 +343,39 @@ class TestFormatting:
         ).plain
         assert "last seen" not in api_key
 
+    def test_stale_served_after_fetch_error_is_labelled_on_both_surfaces(self):
+        # Stale-on-error keeps the last good bars on screen after a 429. The
+        # card header and the `cswap list` detail line both have to say the
+        # numbers are stale, or a rate-limited account reads as current 0%.
+        from claude_swap.switcher import _usage_entry_lines, stale_error_note
+        from claude_swap.tui.widgets import account_card_text
+
+        entry = dataclasses.replace(
+            make_entry(0.0, 0.0, age_s=5949.0), last_error="http-429"
+        )
+        assert stale_error_note(entry) == "stale: rate limited"
+        card = account_card_text(make_account(2, active=True, entry=entry), 100).plain
+        assert "1h 39m ago" in card
+        assert "⚠ stale: rate limited" in card
+        assert "usage unavailable" not in card
+        cli = "\n".join(_usage_entry_lines(entry))
+        assert "stale: rate limited" in cli
+
+        # A fresh failure inside the serve TTL still gets the note.
+        fresh_fail = dataclasses.replace(make_entry(age_s=5.0), last_error="timeout")
+        assert "stale: endpoint timed out" in account_card_text(
+            make_account(2, entry=fresh_fail), 100
+        ).plain
+
+        # Unknown kinds render raw; a clean entry gets no note at all.
+        odd = dataclasses.replace(make_entry(), last_error="http-503")
+        assert stale_error_note(odd) == "stale: http-503"
+        assert stale_error_note(make_entry()) is None
+        assert "stale" not in account_card_text(make_account(2, entry=make_entry()), 100).plain
+
+        # No measurement at all keeps the existing "usage unavailable" path.
+        assert stale_error_note(UsageEntry(last_error="http-429")) is None
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text

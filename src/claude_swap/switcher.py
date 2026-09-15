@@ -251,6 +251,26 @@ SENTINEL_NOTES = {
 }
 
 
+# Short labels for the fetch-error kinds that most often sit behind a
+# stale-served measurement. Anything else renders its raw kind.
+STALE_ERROR_NOTES = {
+    "http-429": "rate limited",
+    "timeout": "endpoint timed out",
+}
+
+
+def stale_error_note(entry: UsageEntry) -> str | None:
+    """"stale: rate limited" when a measurement is served over a failed refresh.
+
+    Stale-on-error keeps the last good numbers on screen after a fetch fails,
+    so without this note a 429'd account looks current. Public: the CLI and
+    the TUI both render it so the two surfaces agree.
+    """
+    if entry.last_good is None or not entry.last_error:
+        return None
+    return f"stale: {STALE_ERROR_NOTES.get(entry.last_error, entry.last_error)}"
+
+
 def last_seen_note(entry: UsageEntry) -> str | None:
     """"last seen 53% used · 12m ago" from an entry's last-good measurement.
 
@@ -292,6 +312,9 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
             and entry.fetched_at is not None
         ):
             lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+        stale = stale_error_note(entry)
+        if lines and stale is not None:
+            lines[-1] += f" · {stale}"
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
